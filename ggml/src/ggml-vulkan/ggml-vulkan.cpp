@@ -2134,6 +2134,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
+            // TEST ONLY: show which cm1 FA variant is really used
+            fprintf(stderr, "ggml_vulkan: FA cm1 pipeline %s variant=%s f32acc=%d Br=%u Bc=%u sg=%u\n", name,
+                    m8 ? "m8" : (getenv("GGML_VK_FA_CM1_FORCE_M16") ? "m16-forced" : "m16"), (int) f32acc, Br, Bc, fa_sgs);
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
