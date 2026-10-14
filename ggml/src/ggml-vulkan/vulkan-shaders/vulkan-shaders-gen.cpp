@@ -738,6 +738,9 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                // 8x16x16 variant for devices without a 16x16x16 shape (e.g. Intel Xe2)
+                string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
+                    merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}, {"FA_CM1_M8", "1"}}), fp16, true, false, f16acc, "_m8");
 #endif
             }
 
@@ -770,6 +773,9 @@ void process_shaders() {
     string_to_spv("flash_attn_f32_f16_bf16", "flash_attn_cm1.comp",
         merge_maps(fa_bf16_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}),
         true, true, false, false);
+    string_to_spv("flash_attn_f32_f16_bf16", "flash_attn_cm1.comp",
+        merge_maps(fa_bf16_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}, {"FA_CM1_M8", "1"}}),
+        true, true, false, false, "_m8");
 #endif
 
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
