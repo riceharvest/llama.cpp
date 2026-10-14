@@ -1275,6 +1275,11 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 // The coopmat1 FA shader uses 16x16x16 muladds, or 8x16x16 ones (the _m8 variant) on devices
 // that only support that shape, e.g. Intel Xe2. P*V always accumulates in f16 for f16 K/V.
 static bool ggml_vk_fa_cm1_use_m8(const vk_device& device, bool f32acc) {
+    // TEST ONLY: GGML_VK_DISABLE_FA_CM1_M8 = master behaviour on Xe2 (scalar FA),
+    // GGML_VK_FA_CM1_FORCE_M16 = the #30503 proposal (16x16x16 shader with only the gate relaxed).
+    if (getenv("GGML_VK_DISABLE_FA_CM1_M8") || getenv("GGML_VK_FA_CM1_FORCE_M16")) {
+        return false;
+    }
     const bool m16 = f32acc ? device->coopmat_support_16x16x16_f32acc : device->coopmat_support_16x16x16_f16acc;
     const bool m8  = device->coopmat_support_8x16x16_f16acc && (!f32acc || device->coopmat_support_8x16x16_f32acc);
     return !m16 && m8;
@@ -1301,6 +1306,13 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    // TEST ONLY: GGML_VK_FA_CM1_SG=16 picks the FA cm1 subgroup size (Intel cm1 matmul uses the min size)
+    if (const char * sg = getenv("GGML_VK_FA_CM1_SG")) {
+        const uint32_t v = (uint32_t) atoi(sg);
+        if (v >= device->subgroup_min_size && v <= device->subgroup_max_size) {
+            result.subgroup_size = v;
+        }
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -1358,7 +1370,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     if (path == FA_COOPMAT1) {
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc) ||
-                        ggml_vk_fa_cm1_use_m8(device, f32acc);
+                        ggml_vk_fa_cm1_use_m8(device, f32acc) ||
+                        getenv("GGML_VK_FA_CM1_FORCE_M16") != nullptr;
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
 
