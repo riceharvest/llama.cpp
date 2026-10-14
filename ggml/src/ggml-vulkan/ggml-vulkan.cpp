@@ -1272,6 +1272,14 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
+// The coopmat1 FA shader uses 16x16x16 muladds, or 8x16x16 ones (the _m8 variant) on devices
+// that only support that shape, e.g. Intel Xe2. P*V always accumulates in f16 for f16 K/V.
+static bool ggml_vk_fa_cm1_use_m8(const vk_device& device, bool f32acc) {
+    const bool m16 = f32acc ? device->coopmat_support_16x16x16_f32acc : device->coopmat_support_16x16x16_f16acc;
+    const bool m8  = device->coopmat_support_8x16x16_f16acc && (!f32acc || device->coopmat_support_8x16x16_f32acc);
+    return !m16 && m8;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
@@ -1349,7 +1357,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 
     if (path == FA_COOPMAT1) {
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+                        (!f32acc && device->coopmat_support_16x16x16_f16acc) ||
+                        ggml_vk_fa_cm1_use_m8(device, f32acc);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
 
@@ -2088,6 +2097,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool fa_ds = fa.first.subgroup_size == 0;
 
             const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
+            const bool m8 = ggml_vk_fa_cm1_use_m8(device, f32acc);
 
             const void * spv_data;
             size_t spv_size;
@@ -2095,12 +2105,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (!device->coopmat_bf16_support) continue;
-                spv_data = flash_attn_f32_f16_bf16_cm1_data;
-                spv_size = flash_attn_f32_f16_bf16_cm1_len;
-                name = aligned ? "flash_attn_f32_bf16_aligned_cm1" : "flash_attn_f32_bf16_cm1";
+                if (m8) { spv_data = flash_attn_f32_f16_bf16_cm1_m8_data; spv_size = flash_attn_f32_f16_bf16_cm1_m8_len; }
+                else    { spv_data = flash_attn_f32_f16_bf16_cm1_data;    spv_size = flash_attn_f32_f16_bf16_cm1_len; }
+                if (m8) { name = aligned ? "flash_attn_f32_bf16_aligned_cm1_m8" : "flash_attn_f32_bf16_cm1_m8"; }
+                else    { name = aligned ? "flash_attn_f32_bf16_aligned_cm1"    : "flash_attn_f32_bf16_cm1"; }
 #else
                 continue;
 #endif
+            } else if (m8) {
+                if (f32acc) { spv_data = flash_attn_f32_f16_cm1_m8_data;        spv_size = flash_attn_f32_f16_cm1_m8_len; }
+                else        { spv_data = flash_attn_f32_f16_f16acc_cm1_m8_data; spv_size = flash_attn_f32_f16_f16acc_cm1_m8_len; }
+                name = aligned ? "flash_attn_f32_f16_aligned_cm1_m8" : "flash_attn_f32_f16_cm1_m8";
             } else {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
@@ -4696,6 +4711,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -4710,6 +4728,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
@@ -8024,6 +8045,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
+    // MatBc is the K/V rows per subgroup, 16 for both the 16x16x16 and the 8x16x16 (_m8) shader.
     const uint32_t MatBr = 16, MatBc = 16;
 
     const uint32_t row_split = Bc / MatBc;
