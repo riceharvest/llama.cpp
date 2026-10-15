@@ -5416,6 +5416,8 @@ struct test_qwen35moe_qk_norm_rope : public test_case {
     ggml_tensor * out = nullptr;
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_QK_NORM_ROPE"; }
+    // K is stored as F16 and the fused kernel reorders the norm/rope arithmetic: 012 measured NMSE 1.3e-7 on SYCL
+    double max_nmse_err() override { return 1e-6; }
     std::string vars() override { return ""; }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { set_rows, out }; }
