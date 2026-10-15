@@ -6645,8 +6645,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
     case VK_VENDOR_ID_INTEL:
         if (device->architecture == vk_device_architecture::INTEL_XE2) {
-            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K) {
                 return true;
+            }
+            // single-token q6_K: on Mesa ANV (Arc Pro B70, Mesa 26.2) the DMMV shader is faster
+            // than MMVQ (e.g. 248320x4096 output head 5.99 vs 9.36 ms); batches still use MMVQ above
+            if (src0_type == GGML_TYPE_Q6_K) {
+                return device->driver_id != vk::DriverId::eIntelOpenSourceMESA;
             }
         }
 
