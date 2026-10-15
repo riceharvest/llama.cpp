@@ -914,8 +914,9 @@ static inline void ggml_sycl_fattn_occupancy(const int id, const int nwarps, con
     n_cores         = info.nsm;
     blocks_per_core = info.max_wg_per_cu;
 
+    static const bool xe2_occupancy = ggml_sycl_get_env("GGML_SYCL_FA_XE2_OCC", 1) != 0;  // test knob
     const gpu_arch arch = info.hw_info.arch;
-    if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 || arch == gpu_arch::intel_gpu_lnl_m) {
+    if (xe2_occupancy && (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 || arch == gpu_arch::intel_gpu_lnl_m)) {
         n_cores         = std::max(1, 2 * info.nsm);
         blocks_per_core = std::max(1, (large_grf ? 32 : 64) / std::max(1, nwarps));
         if (nbytes_shared > 0) {
@@ -1128,6 +1129,20 @@ void launch_fattn(
                 nwaves_best = nwaves;
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
+            }
+        }
+
+        static const int forced_parallel_blocks = ggml_sycl_get_env("GGML_SYCL_FA_PARALLEL_BLOCKS", 0);  // test knob
+        if (forced_parallel_blocks > 0) {
+            parallel_blocks = std::min(forced_parallel_blocks, ntiles_KQ);
+        }
+        static const bool log_split = ggml_sycl_get_env("GGML_SYCL_FA_LOG_SPLIT", 0) != 0;  // test knob
+        if (log_split) {
+            static int n_logged = 0;
+            if (n_logged < 64) {
+                n_logged++;
+                GGML_LOG_INFO("fattn split: q=%d kv=%d ntiles_total=%d nwarps=%d wave=%d parallel_blocks=%d\n",
+                              (int) Q->ne[1], (int) K->ne[1], ntiles_total, nwarps, blocks_per_wave, parallel_blocks);
             }
         }
 

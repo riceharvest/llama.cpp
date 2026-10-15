@@ -1166,7 +1166,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    static const bool allow_gqa_opt = ggml_sycl_get_env("GGML_SYCL_FA_TILE_GQA_OPT", 1) != 0;  // test knob
+    const bool use_gqa_opt = allow_gqa_opt && mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DV == 512) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {
