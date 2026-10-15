@@ -54,3 +54,7 @@ residual_rms_norm 10280 each; concat_state, gdn_rms_gate 7710; qk_norm_rope 2570
 design: moe_gate_residual_rms covers the same nodes when the shared-expert gate is a sigmoid), concat_state_direct and
 gdn_state_io (their matchers do not fit master's graph; under investigation). `GGML_SYCL_ENABLE_GRAPH` has no effect here:
 it is off by default and graphs are disabled for any graph with MUL_MAT_ID.
+
+In the combined `sycl-b70-stack` (with the MoE small-batch and FA changes; testq 012, llama-server, 3 prompts x 256 tokens)
+fusions on vs off are **not** identical: the outputs part at characters 340 / 619 / 476. The fused kernels reorder
+floating-point sums; quality was not measured (a perplexity pair would settle it). Speed there: 79.8 → 87.5 tok/s (+9.6%).
