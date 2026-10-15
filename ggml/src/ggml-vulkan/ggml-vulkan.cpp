@@ -6613,7 +6613,8 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     // where DMMV measured 1.2-3.7x faster on an Arc Pro B70 (q4_0 N=2: 66 vs 243 us; iq4_xs N=2: 80 vs 143 us)
     const bool xe2_dmmv_batch = device->vendor_id == VK_VENDOR_ID_INTEL &&
         device->architecture == vk_device_architecture::INTEL_XE2 &&
-        (src0_type == GGML_TYPE_Q4_0 || (src0_type == GGML_TYPE_IQ4_XS && n <= 4));
+        (src0_type == GGML_TYPE_Q4_0 ||
+         ((src0_type == GGML_TYPE_IQ4_XS || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) && n <= 4));
     if (n > 1 && !xe2_dmmv_batch) {
         return true;
     }
