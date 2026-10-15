@@ -14,6 +14,7 @@ This branch only holds documentation. The code is in the branches below. Each on
 | [`vk-matvec-glu-fusion`](https://github.com/riceharvest/llama.cpp/tree/vk-matvec-glu-fusion) | `ca985d7ae` | mat-vec epilogue computes SWIGLU/GEGLU (on top of the stack) | **parked, never run on a GPU** | [GLU fusion](branches/vk-matvec-glu-fusion.md) |
 | [`sycl-qwen35moe-fusions`](https://github.com/riceharvest/llama.cpp/tree/sycl-qwen35moe-fusions) | `1c7351082` | **SYCL**: port of the b70-optimization-lab qwen35moe decode fusions (10 env flags, default off) | being tested (lab: 131.5 tok/s on Ornith 1.5) | [qwen35moe fusions](branches/sycl-qwen35moe-fusions.md) |
 | [`sycl-mmid-small-batch`](https://github.com/riceharvest/llama.cpp/tree/sycl-mmid-small-batch) | `4f29be7b3` | **SYCL**: fused MUL_MAT_ID GEMV for 2-8 tokens (speculative-decoding verify) | being tested | [MoE verify](branches/sycl-mmid-small-batch.md) |
+| [`sycl-fa-xe2-occupancy`](https://github.com/riceharvest/llama.cpp/tree/sycl-fa-xe2-occupancy) | `f116c0ffa` | **SYCL**: flash-attention KV split sized from Xe2 occupancy (decode at long context); last commit = test knobs | not run yet | [FA occupancy](branches/sycl-fa-xe2-occupancy.md) |
 | [`vk-fa-cm1-m8-testknobs`](https://github.com/riceharvest/llama.cpp/tree/vk-fa-cm1-m8-testknobs) | `499668eaa` | the same work with environment knobs for A/B tests; never for upstream | (test branch) | [test knobs](branches/vk-fa-cm1-m8-testknobs.md) |
 
 Old heads are kept as tags: `archive/vk-mmvq-u32-loads-5bf369db4` (had the results file in the tree),
