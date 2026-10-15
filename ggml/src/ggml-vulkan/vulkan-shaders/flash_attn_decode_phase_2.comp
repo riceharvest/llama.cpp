@@ -29,7 +29,7 @@ layout (push_constant) uniform parameter
   uint qHead;
   uint kvHead;
   uint qkRatio;
-  uint qkSubGroups;
+  uint kvSplits; // >1: split the KV range over workgroups, write partial O/L/M for fa_split_k_reduce
   uint flag;
   uint kvStride1;
   uint kvStride2;
@@ -98,8 +98,10 @@ void main() {
   const uint lane = gl_SubgroupInvocationID;
   const uint v = gl_WorkGroupID.y;
   const uint d = gl_WorkGroupID.z;
-  const uint vWarpIdx = gl_WorkGroupID.x % V_HEAD_GROUPS;
-  const uint outTokIdx = gl_WorkGroupID.x / V_HEAD_GROUPS;
+  const uint baseGroupsX = V_HEAD_GROUPS * ((p.activationLength + N_TOKS_PER_GROUP - 1) / N_TOKS_PER_GROUP);
+  const uint splitK = gl_WorkGroupID.x / baseGroupsX;
+  const uint vWarpIdx = (gl_WorkGroupID.x % baseGroupsX) % V_HEAD_GROUPS;
+  const uint outTokIdx = (gl_WorkGroupID.x % baseGroupsX) / V_HEAD_GROUPS;
   const uint localLinearId = gl_SubgroupID;
   const uint wgLane = localLinearId * WARPSIZE + lane;
   const uint splitIdx = localLinearId;
@@ -113,7 +115,12 @@ void main() {
   const uint offsetSlmP = (SLM_OFFSET_P + wgLane * 4);
   const float fp32Min = uintBitsToFloat(0xFEFFFFFF);
   const float fp32Max = uintBitsToFloat(0x7EFFFFFF);
-  uint offsetV = offsetBaseV;
+  // This workgroup's range of MATP_PER_LOOP chunks. The host makes every split non-empty.
+  const uint loopCount = (p.kvSeqLen + MATP_PER_LOOP - 1) / MATP_PER_LOOP;
+  const uint loopsPerSplit = (loopCount + p.kvSplits - 1) / p.kvSplits;
+  const uint loopBegin = min(splitK * loopsPerSplit, loopCount);
+  const uint loopEnd = min(loopBegin + loopsPerSplit, loopCount);
+  uint offsetV = offsetBaseV + loopBegin * MATP_PER_LOOP * kvDim;
 
   coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[ALIGNED_P_M][MAT_O_N];
   f16vec4 pStateTemp[P_LOAD_LOOPS];
@@ -171,7 +178,7 @@ void main() {
     const uint flatOffset = (pLoad * GROUPSIZE + wgLane) / P_REDUCE_VEC4;
     const uint rowIdxFlat = flatOffset % GQA_RATIO;
     const uint tokenIdxFlat = min(flatOffset / GQA_RATIO, N_TOKS_PER_GROUP - 1);
-    loadColBase[pLoad] = (pLoad * GROUPSIZE + wgLane) % P_REDUCE_VEC4;
+    loadColBase[pLoad] = (pLoad * GROUPSIZE + wgLane) % P_REDUCE_VEC4 + loopBegin * P_REDUCE_VEC4;
     loadRowBase[pLoad] = (tokenIdxFlat * p.qHead + rowIdxFlat);
     fp32SoftMaxSum[pLoad] = 0.0f;
     fp32GlobalMaxP[pLoad] = slm_pool_f32.slm_pool_o[SLM_OFFSET_GLOBAL_MAX + flatOffset];
@@ -181,7 +188,7 @@ void main() {
     const uint flatOffset = (maxLoad * GROUPSIZE + wgLane) / MAX_PER_LOOP;
     const uint rowIdxFlat = flatOffset % GQA_RATIO;
     const uint tokenIdxFlat = min(flatOffset / GQA_RATIO, N_TOKS_PER_GROUP - 1);
-    maxColBase[maxLoad] = (maxLoad * GROUPSIZE + wgLane) % MAX_PER_LOOP;
+    maxColBase[maxLoad] = (maxLoad * GROUPSIZE + wgLane) % MAX_PER_LOOP + loopBegin * (MATP_PER_LOOP / MATP_REDUCE);
     maxRowBase[maxLoad] = (tokenIdxFlat * p.qHead + rowIdxFlat);
   }
 
@@ -224,13 +231,12 @@ void main() {
     loadColBase[pLoad] = loadColBase[pLoad] + P_REDUCE_VEC4;
   }
 
-  const uint loopCount = (p.kvSeqLen + MATP_PER_LOOP - 1) / MATP_PER_LOOP;
 
-  for (uint loop = 0; loop < loopCount; loop++) {
-    const uint slmPingPongLoad = (loop & 0x1);
-    const uint slmPingPongStore = ((loop + 1) & 0x1);
+  for (uint loop = loopBegin; loop < loopEnd; loop++) {
+    const uint slmPingPongLoad = ((loop - loopBegin) & 0x1);
+    const uint slmPingPongStore = ((loop - loopBegin + 1) & 0x1);
 
-    if (loop + 1 < loopCount) {
+    if (loop + 1 < loopEnd) {
       [[unroll]] for (uint pLoad = 0; pLoad < P_LOAD_LOOPS; pLoad++) {
         const uint flatOffset = loadRowBase[pLoad] * pDim / 4 + loadColBase[pLoad];
         pStateTemp[pLoad] = pStateVec4[offsetBaseP + flatOffset];
@@ -275,7 +281,7 @@ void main() {
     if (loop * MATP_PER_LOOP + splitIdx * TK >= p.kvSeqLen) {
       offsetV = 0;
     }
-    if (loop + 1 < loopCount) {
+    if (loop + 1 < loopEnd) {
       [[unroll]] for (uint pLoad = 0; pLoad < P_LOAD_LOOPS; pLoad++) {
         const uint maxOffset = (pLoad * GROUPSIZE + wgLane) / SLM_MAX_STRIDE;
         if (loadColBase[pLoad] < pDim / 4) {
@@ -335,7 +341,21 @@ void main() {
       }
     }
 
-    if ((0x1 & p.flag) != 0) {
+    if (p.kvSplits > 1) {
+      // Partial result: store the raw sum as L and the global max as M, fa_split_k_reduce normalizes.
+      const uint rows = p.qHead * p.activationLength * gl_NumWorkGroups.z;
+      [[unroll]] for (uint pm = 0; pm < ALIGNED_P_M; pm++) {
+        slm_pool_f32.slm_pool_o[SLM_OFFSET_SOFTMAX_SUM + pm * WARPSIZE + lane] = 1.0f;
+        const uint flatOffset = pm * WARPSIZE + lane;
+        const uint tok = N_TOKS_PER_GROUP * outTokIdx + flatOffset / GQA_RATIO;
+        const uint head = v * GQA_RATIO + flatOffset % GQA_RATIO;
+        if (vWarpIdx == 0 && outputMask[pm]) {
+          const uint lm = HEAD_DIM * rows * p.kvSplits + p.qHead * 2 * (splitK + p.kvSplits * (tok + p.activationLength * d)) + head;
+          out_f32[lm] = sumTemp[pm][0];
+          out_f32[lm + p.qHead] = slm_pool_f32.slm_pool_o[SLM_OFFSET_GLOBAL_MAX + pm * WARPSIZE + lane];
+        }
+      }
+    } else if ((0x1 & p.flag) != 0) {
       [[unroll]] for (uint pm = 0; pm < ALIGNED_P_M; pm++) {
         float fp32GlobalMax = slm_pool_f32.slm_pool_o[SLM_OFFSET_GLOBAL_MAX + pm * WARPSIZE + lane];
         float sinkCompensation = fp32GlobalMax - fp32SinkCoeff[pm];
@@ -400,7 +420,15 @@ void main() {
 
       [[unroll]] for (uint pm = 0; pm < ALIGNED_P_M; pm++) {
         if (outputMask[pm] == true) {
-          out_f32_vec4[offsetOutBase + outOffsets[pm] + vg] = vec4(fp32Output[pm][0], fp32Output[pm][1], fp32Output[pm][2], fp32Output[pm][3]);
+          uint o = offsetOutBase + outOffsets[pm] + vg;
+          if (p.kvSplits > 1) {
+            // [HEAD_DIM, qHead] block per (split, token, batch), as fa_split_k_reduce reads it
+            const uint flatOffset = pm * WARPSIZE + lane;
+            const uint tok = N_TOKS_PER_GROUP * outTokIdx + flatOffset / GQA_RATIO;
+            const uint head = v * GQA_RATIO + flatOffset % GQA_RATIO;
+            o = (((splitK + p.kvSplits * (tok + p.activationLength * d)) * p.qHead + head) * HEAD_DIM + vWarpIdx * WARP_V_DIM) / 4 + vg;
+          }
+          out_f32_vec4[o] = vec4(fp32Output[pm][0], fp32Output[pm][1], fp32Output[pm][2], fp32Output[pm][3]);
         }
       }
     }
