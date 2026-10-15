@@ -288,7 +288,8 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
 
-    const float * s_d   = (const float *) src_state->data;
+    const float * s_d   = cache != nullptr && cache->input_data != nullptr
+        ? cache->input_data : (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));

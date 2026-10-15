@@ -17,4 +17,11 @@
 
 void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor *dst);
 
+void ggml_sycl_concat_state_update(
+        ggml_backend_sycl_context & ctx, ggml_tensor * concat, ggml_tensor * cpy);
+
+void ggml_sycl_concat_state_update_direct(
+        ggml_backend_sycl_context & ctx, ggml_tensor * get_rows,
+        ggml_tensor * concat, ggml_tensor * cpy);
+
 #endif // GGML_SYCL_CONCAT_HPP

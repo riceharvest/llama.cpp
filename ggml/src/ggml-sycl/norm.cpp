@@ -1,5 +1,6 @@
 #include "norm.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/presets.hpp"
 
 static void norm_f32(const float* x, float* dst, const int ncols,
@@ -535,6 +536,191 @@ static void rms_norm_mul_add_f32_sycl(const float* x, const float* mul, const fl
     }
 }
 
+static void residual_rms_norm_mul_f32_sycl(
+        const float * add0,
+        const float * add1,
+        volatile float * residual,
+        const float * mul,
+        float * dst,
+        const int ncols,
+        const float eps,
+        queue_ptr stream,
+        int device) {
+    const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+    GGML_ASSERT(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+    const sycl::range<3> block_dims(1, 1, work_group_size);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_dims, block_dims),
+            [=](sycl::nd_item<3> item)
+            [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int tid = item.get_local_id(2);
+                const int nwarps = work_group_size / WARP_SIZE;
+                float tmp = 0.0f;
+
+                for (int col = tid; col < ncols; col += work_group_size) {
+                    residual[col] = add0[col] + add1[col];
+                    const float xi = residual[col];
+                    tmp += xi * xi;
+                }
+
+                tmp = warp_reduce_sum(tmp, item);
+                const auto sub_group = item.get_sub_group();
+                const auto sg_id = sub_group.get_group_linear_id();
+                const auto wi_in_sg = sub_group.get_local_linear_id();
+                if (wi_in_sg == 0) {
+                    s_sum_acc[sg_id] = tmp;
+                }
+
+                item.barrier(sycl::access::fence_space::local_space);
+                const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
+                tmp = 0.0f;
+                for (size_t i = 0; i < nreduce; ++i) {
+                    tmp += s_sum_acc[wi_in_sg + i * WARP_SIZE];
+                }
+                tmp = warp_reduce_sum(tmp, item);
+
+                const float scale = sycl::rsqrt(tmp / ncols + eps);
+                for (int col = tid; col < ncols; col += work_group_size) {
+                    dst[col] = scale * residual[col] * mul[col];
+                }
+            });
+    });
+}
+
+static void moe_shared_residual_rms_norm_mul_f32_sycl(
+        const float * routed,
+        const float * shared,
+        volatile float * ffn_out,
+        const float * residual_in,
+        volatile float * residual_out,
+        const float * mul,
+        float * dst,
+        const int ncols,
+        const float eps,
+        queue_ptr stream,
+        int device) {
+    const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+    GGML_ASSERT(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+    const sycl::range<3> block_dims(1, 1, work_group_size);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_dims, block_dims),
+            [=](sycl::nd_item<3> item)
+            [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int tid = item.get_local_id(2);
+                const int nwarps = work_group_size / WARP_SIZE;
+                float tmp = 0.0f;
+
+                for (int col = tid; col < ncols; col += work_group_size) {
+                    // Preserve both graph-visible FP32 rounding boundaries. Volatile global
+                    // stores prevent reassociation into routed + shared + residual_in.
+                    ffn_out[col] = routed[col] + shared[col];
+                    const float rounded_ffn = ffn_out[col];
+                    residual_out[col] = rounded_ffn + residual_in[col];
+                    const float xi = residual_out[col];
+                    tmp += xi * xi;
+                }
+
+                tmp = warp_reduce_sum(tmp, item);
+                const auto sub_group = item.get_sub_group();
+                const auto sg_id = sub_group.get_group_linear_id();
+                const auto wi_in_sg = sub_group.get_local_linear_id();
+                if (wi_in_sg == 0) {
+                    s_sum_acc[sg_id] = tmp;
+                }
+
+                item.barrier(sycl::access::fence_space::local_space);
+                const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
+                tmp = 0.0f;
+                for (size_t i = 0; i < nreduce; ++i) {
+                    tmp += s_sum_acc[wi_in_sg + i * WARP_SIZE];
+                }
+                tmp = warp_reduce_sum(tmp, item);
+
+                const float scale = sycl::rsqrt(tmp / ncols + eps);
+                for (int col = tid; col < ncols; col += work_group_size) {
+                    dst[col] = scale * residual_out[col] * mul[col];
+                }
+            });
+    });
+}
+
+static void moe_shared_gate_residual_rms_norm_mul_f32_sycl(
+        const float * gate_in,
+        const float * shared,
+        volatile float * shared_gated,
+        const float * routed,
+        volatile float * ffn_out,
+        const float * residual_in,
+        volatile float * residual_out,
+        const float * mul,
+        float * dst,
+        const int ncols,
+        const float eps,
+        queue_ptr stream,
+        int device) {
+    const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+    GGML_ASSERT(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+    const sycl::range<3> block_dims(1, 1, work_group_size);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> s_sum_acc(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+        sycl::local_accessor<float, 1> s_gate(sycl::range<1>(1), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_dims, block_dims),
+            [=](sycl::nd_item<3> item)
+            [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int tid = item.get_local_id(2);
+                const int nwarps = work_group_size / WARP_SIZE;
+                if (tid == 0) {
+                    // Match the stock FP32 sigmoid and force its output rounding
+                    // before the broadcast multiply.
+                    s_gate[0] = 1.0f / (1.0f + op_exp(-gate_in[0]));
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                const float gate = s_gate[0];
+                float tmp = 0.0f;
+
+                for (int col = tid; col < ncols; col += work_group_size) {
+                    // Preserve all three graph-visible FP32 rounding boundaries.
+                    shared_gated[col] = shared[col] * gate;
+                    const float rounded_shared = shared_gated[col];
+                    ffn_out[col] = routed[col] + rounded_shared;
+                    const float rounded_ffn = ffn_out[col];
+                    residual_out[col] = rounded_ffn + residual_in[col];
+                    const float xi = residual_out[col];
+                    tmp += xi * xi;
+                }
+
+                tmp = warp_reduce_sum(tmp, item);
+                const auto sub_group = item.get_sub_group();
+                const auto sg_id = sub_group.get_group_linear_id();
+                const auto wi_in_sg = sub_group.get_local_linear_id();
+                if (wi_in_sg == 0) {
+                    s_sum_acc[sg_id] = tmp;
+                }
+
+                item.barrier(sycl::access::fence_space::local_space);
+                const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
+                tmp = 0.0f;
+                for (size_t i = 0; i < nreduce; ++i) {
+                    tmp += s_sum_acc[wi_in_sg + i * WARP_SIZE];
+                }
+                tmp = warp_reduce_sum(tmp, item);
+
+                const float scale = sycl::rsqrt(tmp / ncols + eps);
+                for (int col = tid; col < ncols; col += work_group_size) {
+                    dst[col] = scale * residual_out[col] * mul[col];
+                }
+            });
+    });
+}
+
 template<int warp_size>
 static void l2_norm_f32_sycl(const float *   x,
                              float *         dst,
@@ -916,6 +1102,162 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
         s00, s01, s02, s03, d00, d01, d02, d03,
         mul_s01, mul_s02, mul_s03, mul_nrows, mul_nchannels, mul_nsamples,
         add_s01, add_s02, add_s03, add_nrows, add_nchannels, add_nsamples, eps, main_stream, ctx.device);
+}
+
+void ggml_sycl_op_qwen35moe_gdn_rms_silu_gate_fused(
+        ggml_backend_sycl_context & ctx, ggml_tensor * rms_norm,
+        ggml_tensor * weight_mul, ggml_tensor * silu, ggml_tensor * gate_mul) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * weight = weight_mul->src[0] == rms_norm
+        ? weight_mul->src[1] : weight_mul->src[0];
+    const ggml_tensor * z = silu->src[0];
+
+    GGML_ASSERT(x != nullptr && weight != nullptr && z != nullptr);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 &&
+                weight_mul->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+                gate_mul->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[0] == 128 && x->ne[1] == 32 &&
+                x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(weight) &&
+                ggml_is_contiguous(z) && ggml_is_contiguous(gate_mul));
+    GGML_ASSERT(ggml_nelements(weight) == 128 && ggml_nelements(z) == 4096 &&
+                ggml_nelements(gate_mul) == 4096);
+
+    float eps = 0.0f;
+    std::memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const float * x_d = static_cast<const float *>(x->data);
+    const float * w_d = static_cast<const float *>(weight->data);
+    const float * z_d = static_cast<const float *>(z->data);
+    float * dst_d = static_cast<float *>(gate_mul->data);
+    queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    constexpr int ncols = 128;
+    constexpr int nheads = 32;
+    constexpr int block_size = WARP_SIZE;
+    const sycl::range<1> block(block_size);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(nheads * block_size), block),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int head = item.get_group(0);
+            const int tid = item.get_local_id(0);
+            const int base = head * ncols;
+
+            float sum_sq = 0.0f;
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = x_d[base + col];
+                sum_sq += xi * xi;
+            }
+            // Match rms_norm_f32()'s XOR-tree reduction order exactly.
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                sum_sq += dpct::permute_sub_group_by_xor(item.get_sub_group(), sum_sq, mask);
+            }
+            const float scale = sycl::rsqrt(sum_sq / ncols + eps);
+
+            for (int col = tid; col < ncols; col += block_size) {
+                const int idx = base + col;
+                // Preserve the graph's FP32 materialization boundary between
+                // RMS*weight and SiLU(z)*normalized.
+                volatile float normalized = scale * x_d[idx] * w_d[col];
+                dst_d[idx] = op_silu(z_d[idx]) * normalized;
+            }
+        });
+}
+
+void ggml_sycl_op_residual_rms_norm_fused(
+        ggml_backend_sycl_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
+    GGML_ASSERT(add->src[0] != nullptr && add->src[1] != nullptr && rms_norm->src[0] == add);
+    GGML_ASSERT(add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(add->ne[0] == 2048 && add->ne[1] == 1 && add->ne[2] == 1 && add->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(add) && ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]));
+
+    const ggml_tensor * mul_src = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    GGML_ASSERT(mul_src != nullptr && mul_src->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_src));
+    GGML_ASSERT(mul_src->ne[0] == 2048 && ggml_nelements(mul_src) == 2048);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    residual_rms_norm_mul_f32_sycl(
+        static_cast<const float *>(add->src[0]->data),
+        static_cast<const float *>(add->src[1]->data),
+        static_cast<volatile float *>(add->data),
+        static_cast<const float *>(mul_src->data),
+        static_cast<float *>(mul_tensor->data),
+        2048, eps, ctx.stream(), ctx.device);
+}
+
+void ggml_sycl_op_moe_shared_residual_rms_norm_fused(
+        ggml_backend_sycl_context & ctx, ggml_tensor * ffn_add,
+        ggml_tensor * residual_add, ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
+    GGML_ASSERT(ffn_add->src[0] != nullptr && ffn_add->src[1] != nullptr);
+    GGML_ASSERT(residual_add->src[0] == ffn_add || residual_add->src[1] == ffn_add);
+    GGML_ASSERT(rms_norm->src[0] == residual_add);
+    GGML_ASSERT(ffn_add->type == GGML_TYPE_F32 && residual_add->type == GGML_TYPE_F32);
+    GGML_ASSERT(rms_norm->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ffn_add->ne[0] == 2048 && ffn_add->ne[1] == 1 &&
+                ffn_add->ne[2] == 1 && ffn_add->ne[3] == 1);
+
+    const ggml_tensor * residual_in = residual_add->src[0] == ffn_add
+        ? residual_add->src[1] : residual_add->src[0];
+    const ggml_tensor * mul_src = mul_tensor->src[0] == rms_norm
+        ? mul_tensor->src[1] : mul_tensor->src[0];
+    GGML_ASSERT(residual_in != nullptr && mul_src != nullptr);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    moe_shared_residual_rms_norm_mul_f32_sycl(
+        static_cast<const float *>(ffn_add->src[0]->data),
+        static_cast<const float *>(ffn_add->src[1]->data),
+        static_cast<volatile float *>(ffn_add->data),
+        static_cast<const float *>(residual_in->data),
+        static_cast<volatile float *>(residual_add->data),
+        static_cast<const float *>(mul_src->data),
+        static_cast<float *>(mul_tensor->data),
+        2048, eps, ctx.stream(), ctx.device);
+}
+
+void ggml_sycl_op_moe_shared_gate_residual_rms_norm_fused(
+        ggml_backend_sycl_context & ctx, ggml_tensor * gate_sigmoid,
+        ggml_tensor * shared_gated, ggml_tensor * ffn_add,
+        ggml_tensor * residual_add, ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
+    GGML_ASSERT(gate_sigmoid->src[0] != nullptr);
+    GGML_ASSERT(shared_gated->src[0] != nullptr && shared_gated->src[1] != nullptr);
+    GGML_ASSERT(ffn_add->src[0] != nullptr && ffn_add->src[1] != nullptr);
+    GGML_ASSERT(residual_add->src[0] == ffn_add || residual_add->src[1] == ffn_add);
+    GGML_ASSERT(rms_norm->src[0] == residual_add);
+
+    const ggml_tensor * shared = shared_gated->src[0] == gate_sigmoid
+        ? shared_gated->src[1] : shared_gated->src[0];
+    const ggml_tensor * routed = ffn_add->src[0] == shared_gated
+        ? ffn_add->src[1] : ffn_add->src[0];
+    const ggml_tensor * residual_in = residual_add->src[0] == ffn_add
+        ? residual_add->src[1] : residual_add->src[0];
+    const ggml_tensor * mul_src = mul_tensor->src[0] == rms_norm
+        ? mul_tensor->src[1] : mul_tensor->src[0];
+    GGML_ASSERT(shared != nullptr && routed != nullptr && residual_in != nullptr && mul_src != nullptr);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    moe_shared_gate_residual_rms_norm_mul_f32_sycl(
+        static_cast<const float *>(gate_sigmoid->src[0]->data),
+        static_cast<const float *>(shared->data),
+        static_cast<volatile float *>(shared_gated->data),
+        static_cast<const float *>(routed->data),
+        static_cast<volatile float *>(ffn_add->data),
+        static_cast<const float *>(residual_in->data),
+        static_cast<volatile float *>(residual_add->data),
+        static_cast<const float *>(mul_src->data),
+        static_cast<float *>(mul_tensor->data),
+        2048, eps, ctx.stream(), ctx.device);
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

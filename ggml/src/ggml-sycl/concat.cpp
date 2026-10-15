@@ -507,3 +507,159 @@ void ggml_sycl_op_concat(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
     break;
     }
 }
+
+void ggml_sycl_concat_state_update(
+        ggml_backend_sycl_context & ctx, ggml_tensor * concat, ggml_tensor * cpy) {
+    GGML_ASSERT(concat != nullptr && cpy != nullptr);
+    GGML_ASSERT(concat->op == GGML_OP_CONCAT && cpy->op == GGML_OP_CPY);
+    GGML_ASSERT(concat->src[0] != nullptr && concat->src[1] != nullptr);
+    GGML_ASSERT(cpy->src[0] != nullptr && cpy->src[1] != nullptr);
+    GGML_ASSERT(concat->type == GGML_TYPE_F32);
+    GGML_ASSERT(concat->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(concat->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(cpy->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(cpy->src[1]->type == GGML_TYPE_F32);
+
+    const int32_t dim = ((const int32_t *) concat->op_params)[0];
+    GGML_ASSERT(dim == 0);
+    GGML_ASSERT(concat->src[0]->ne[0] + concat->src[1]->ne[0] == concat->ne[0]);
+    GGML_ASSERT(concat->src[1]->ne[0] == 1);
+    GGML_ASSERT(cpy->src[0]->ne[0] == concat->ne[0] - 1);
+    GGML_ASSERT(ggml_nelements(cpy->src[0]) == ggml_nelements(cpy->src[1]));
+    GGML_ASSERT(ggml_is_contiguous(concat));
+    GGML_ASSERT(ggml_is_contiguous(cpy->src[1]));
+    GGML_ASSERT(cpy->src[0]->data == (char *) concat->data + concat->nb[0]);
+    GGML_ASSERT(cpy->src[0]->nb[0] == concat->nb[0]);
+    GGML_ASSERT(cpy->src[0]->nb[1] == concat->nb[1]);
+    GGML_ASSERT(cpy->src[0]->nb[2] == concat->nb[2]);
+    GGML_ASSERT(cpy->src[0]->nb[3] == concat->nb[3]);
+
+    const ggml_tensor * src0 = concat->src[0];
+    const ggml_tensor * src1 = concat->src[1];
+    ggml_tensor * state = cpy->src[1];
+
+    const char * src0_data = (const char *) src0->data;
+    const char * src1_data = (const char *) src1->data;
+    char * concat_data = (char *) concat->data;
+    float * state_data = (float *) state->data;
+
+    const int64_t ne0 = concat->ne[0];
+    const int64_t ne1 = concat->ne[1];
+    const int64_t ne2 = concat->ne[2];
+    const int64_t ne3 = concat->ne[3];
+    const int64_t ne00 = src0->ne[0];
+    const uint64_t nb00 = src0->nb[0];
+    const uint64_t nb01 = src0->nb[1];
+    const uint64_t nb02 = src0->nb[2];
+    const uint64_t nb03 = src0->nb[3];
+    const uint64_t nb10 = src1->nb[0];
+    const uint64_t nb11 = src1->nb[1];
+    const uint64_t nb12 = src1->nb[2];
+    const uint64_t nb13 = src1->nb[3];
+    const uint64_t nb0 = concat->nb[0];
+    const uint64_t nb1 = concat->nb[1];
+    const uint64_t nb2 = concat->nb[2];
+    const uint64_t nb3 = concat->nb[3];
+    const size_t total = (size_t) ne0 * (size_t) ne1 * (size_t) ne2 * (size_t) ne3;
+    constexpr size_t wg = 256;
+    const size_t global = ((total + wg - 1) / wg) * wg;
+
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+        [=](sycl::nd_item<1> item) {
+            const size_t linear = item.get_global_id(0);
+            if (linear >= total) {
+                return;
+            }
+
+            size_t rem = linear;
+            const int64_t i0 = rem % ne0; rem /= ne0;
+            const int64_t i1 = rem % ne1; rem /= ne1;
+            const int64_t i2 = rem % ne2; rem /= ne2;
+            const int64_t i3 = rem;
+
+            const char * in = i0 < ne00
+                ? src0_data + i0 * nb00 + i1 * nb01 + i2 * nb02 + i3 * nb03
+                : src1_data + (i0 - ne00) * nb10 + i1 * nb11 + i2 * nb12 + i3 * nb13;
+            const float value = *(const float *) in;
+            *(float *) (concat_data + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3) = value;
+
+            if (i0 != 0) {
+                const size_t state_index = (size_t) (i0 - 1) + (size_t) (ne0 - 1) *
+                    ((size_t) i1 + (size_t) ne1 * ((size_t) i2 + (size_t) ne2 * (size_t) i3));
+                state_data[state_index] = value;
+            }
+        });
+}
+
+void ggml_sycl_concat_state_update_direct(
+        ggml_backend_sycl_context & ctx, ggml_tensor * get_rows,
+        ggml_tensor * concat, ggml_tensor * cpy) {
+    GGML_ASSERT(get_rows != nullptr && concat != nullptr && cpy != nullptr);
+    GGML_ASSERT(get_rows->op == GGML_OP_GET_ROWS);
+    GGML_ASSERT(concat->op == GGML_OP_CONCAT && cpy->op == GGML_OP_CPY);
+    GGML_ASSERT(get_rows->src[0] != nullptr && get_rows->src[1] != nullptr);
+    GGML_ASSERT(concat->src[0] != nullptr && concat->src[1] != nullptr);
+    GGML_ASSERT(cpy->src[0] != nullptr && cpy->src[1] != nullptr);
+    GGML_ASSERT(get_rows->type == GGML_TYPE_F32);
+    GGML_ASSERT(get_rows->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(get_rows->src[1]->type == GGML_TYPE_I32);
+    GGML_ASSERT(concat->type == GGML_TYPE_F32);
+    GGML_ASSERT(concat->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(concat->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(cpy->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(cpy->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(get_rows));
+    GGML_ASSERT(ggml_is_contiguous(get_rows->src[0]));
+    GGML_ASSERT(ggml_nrows(get_rows) == 1);
+    GGML_ASSERT(ggml_nrows(get_rows->src[0]) == 1);
+    GGML_ASSERT(ggml_nelements(get_rows) == 3 * 8192);
+    GGML_ASSERT(ggml_nelements(get_rows->src[0]) == ggml_nelements(get_rows));
+    GGML_ASSERT(concat->ne[0] == 4 && concat->ne[1] == 8192);
+    GGML_ASSERT(concat->ne[2] == 1 && concat->ne[3] == 1);
+    GGML_ASSERT(concat->src[0]->ne[0] == 3 && concat->src[0]->ne[1] == 8192);
+    GGML_ASSERT(concat->src[1]->ne[0] == 1 && concat->src[1]->ne[1] == 8192);
+    GGML_ASSERT(ggml_is_contiguous(concat));
+    GGML_ASSERT(ggml_is_contiguous(cpy->src[1]));
+    GGML_ASSERT(concat->src[0]->data == get_rows->data);
+    GGML_ASSERT(cpy->src[1]->data == get_rows->src[0]->data);
+    GGML_ASSERT(cpy->src[0]->data == (char *) concat->data + concat->nb[0]);
+
+    const float * persistent_in = (const float *) get_rows->src[0]->data;
+    float * get_rows_out = (float *) get_rows->data;
+    const char * current = (const char *) concat->src[1]->data;
+    char * concat_out = (char *) concat->data;
+    float * persistent_out = (float *) cpy->src[1]->data;
+
+    const uint64_t current_nb1 = concat->src[1]->nb[1];
+    const uint64_t concat_nb0 = concat->nb[0];
+    const uint64_t concat_nb1 = concat->nb[1];
+    constexpr size_t channels = 8192;
+    constexpr size_t wg = 256;
+
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(channels), sycl::range<1>(wg)),
+        [=](sycl::nd_item<1> item) {
+            const size_t channel = item.get_global_id(0);
+            const size_t old_base = 3 * channel;
+
+            // Load the complete old state before writing the overlapping persistent buffer.
+            const float old0 = persistent_in[old_base + 0];
+            const float old1 = persistent_in[old_base + 1];
+            const float old2 = persistent_in[old_base + 2];
+            const float value = *(const float *) (current + channel * current_nb1);
+
+            // Materialize every graph-visible result even though their stock kernels are skipped.
+            get_rows_out[old_base + 0] = old0;
+            get_rows_out[old_base + 1] = old1;
+            get_rows_out[old_base + 2] = old2;
+            *(float *) (concat_out + channel * concat_nb1 + 0 * concat_nb0) = old0;
+            *(float *) (concat_out + channel * concat_nb1 + 1 * concat_nb0) = old1;
+            *(float *) (concat_out + channel * concat_nb1 + 2 * concat_nb0) = old2;
+            *(float *) (concat_out + channel * concat_nb1 + 3 * concat_nb0) = value;
+
+            persistent_out[old_base + 0] = old1;
+            persistent_out[old_base + 1] = old2;
+            persistent_out[old_base + 2] = value;
+        });
+}
