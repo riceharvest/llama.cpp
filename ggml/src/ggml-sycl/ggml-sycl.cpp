@@ -5380,8 +5380,8 @@ static std::atomic<uint64_t> g_ggml_sycl_qwen35moe_moe_gate_up_hits{0};
 static bool ggml_sycl_qwen35moe_moe_gate_up_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_MOE_GATE_UP");
-        const bool on = value != nullptr && std::atoi(value) != 0;
-        if (on) {
+        const bool on = value == nullptr || std::atoi(value) != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr, "ggml_sycl_qwen35moe_moe_gate_up: fused_hits=%" PRIu64 "\n",
                     g_ggml_sycl_qwen35moe_moe_gate_up_hits.load(std::memory_order_relaxed));
@@ -6470,7 +6470,7 @@ struct ggml_sycl_moe_add_reduce_match {
 static bool ggml_sycl_moe_add_reduce_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_MOE_ADD_REDUCE");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
 }
@@ -6583,8 +6583,8 @@ static std::atomic<uint64_t> g_ggml_sycl_residual_rms_norm_hits{0};
 static bool ggml_sycl_residual_rms_norm_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_RESIDUAL_RMS_NORM");
-        const bool on = value != nullptr && std::atoi(value) != 0;
-        if (on) {
+        const bool on = value == nullptr || std::atoi(value) != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr, "ggml_sycl_residual_rms_norm: fused_hits=%" PRIu64 "\n",
                     g_ggml_sycl_residual_rms_norm_hits.load(std::memory_order_relaxed));
@@ -6631,8 +6631,8 @@ static std::atomic<uint64_t> g_ggml_sycl_qwen35moe_moe_shared_residual_rms_hits{
 static bool ggml_sycl_qwen35moe_moe_shared_residual_rms_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_MOE_SHARED_RESIDUAL_RMS");
-        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
-        if (on) {
+        const bool on = value == nullptr || std::strcmp(value, "0") != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr,
                     "ggml_sycl_qwen35moe_moe_shared_residual_rms: fused_hits=%" PRIu64 "\n",
@@ -6691,8 +6691,8 @@ static std::atomic<uint64_t> g_ggml_sycl_qwen35moe_moe_gate_residual_rms_hits{0}
 static bool ggml_sycl_qwen35moe_moe_gate_residual_rms_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_MOE_GATE_RESIDUAL_RMS");
-        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
-        if (on) {
+        const bool on = value == nullptr || std::strcmp(value, "0") != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr,
                     "ggml_sycl_qwen35moe_moe_gate_residual_rms: fused_hits=%" PRIu64 "\n",
@@ -6945,8 +6945,8 @@ static std::atomic<uint64_t> g_ggml_sycl_qwen35moe_qk_norm_rope_hits{0};
 static bool ggml_sycl_qwen35moe_qk_norm_rope_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_QK_NORM_ROPE");
-        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
-        if (on) {
+        const bool on = value == nullptr || std::strcmp(value, "0") != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr,
                     "ggml_sycl_qwen35moe_qk_norm_rope: fused_hits=%" PRIu64 "\n",
@@ -6961,8 +6961,8 @@ static bool ggml_sycl_qwen35moe_qk_norm_rope_enabled() {
 static bool ggml_sycl_qwen35moe_concat_state_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_CONCAT_STATE");
-        const bool on = value != nullptr && std::atoi(value) != 0;
-        if (on) {
+        const bool on = value == nullptr || std::atoi(value) != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr, "ggml_sycl_qwen35moe_concat_state: fused_hits=%" PRIu64 "\n",
                     g_ggml_sycl_qwen35moe_concat_state_hits.load(std::memory_order_relaxed));
@@ -7010,8 +7010,8 @@ static std::atomic<uint64_t> g_ggml_sycl_qwen35moe_gdn_rms_gate_hits{0};
 static bool ggml_sycl_qwen35moe_gdn_rms_gate_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_FUSED_QWEN35MOE_GDN_RMS_GATE");
-        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
-        if (on) {
+        const bool on = value == nullptr || std::strcmp(value, "0") != 0;
+        if (on && value != nullptr) {  // hit counts only when the flag is set explicitly
             std::atexit([] {
                 std::fprintf(stderr,
                     "ggml_sycl_qwen35moe_gdn_rms_gate: fused_hits=%" PRIu64 "\n",
