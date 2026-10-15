@@ -1868,6 +1868,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 l_warptile_mmq  = { 512, 128, 256, 32, 32, 32, 2, tm_l, tn_l, tk_l, 16 };
                 l_mmq_wg_denoms = { 128, 256, 1 };
                 l_align         = 32;  //set as BK
+                // f16/bf16/f32 weights: the same 128x256, BK=32, subgroup-16 tile beats the generic one above
+                // (Arc Pro B70, m=4096 n=512 k=14336: f16 30 -> 46 TFLOPS, bf16 9 -> 15)
+                l_warptile      = { 512, 128, 256, 32, 32, 32, 2, tm_l, tn_l, tk_l, 16 };
+                l_wg_denoms     = { 128, 256, 1 };
             }
         }
 
