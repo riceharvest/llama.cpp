@@ -6676,6 +6676,8 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_IQ4_XS:
+        // Arc Pro B70 (Mesa): single-token iq1_m DMMV 64.0 vs MMVQ 85.7 us
+        case GGML_TYPE_IQ1_M:
             return false;
         default:
             return true;
