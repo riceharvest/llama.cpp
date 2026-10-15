@@ -3231,7 +3231,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             uint32_t head_dim_pv = std::get<1>(HdQk);
             uint32_t gqa_ratio = std::get<2>(HdQk);
             uint32_t q_len = std::get<3>(HdQk);
-            const uint32_t out_dim_per_wg = gqa_ratio > 16 ? 8 : 16;
+            const uint32_t out_dim_per_wg = getenv("GGML_VK_XE_FA_VDIM") ? (uint32_t) atoi(getenv("GGML_VK_XE_FA_VDIM")) : (gqa_ratio > 16 ? 8 : 16); // TEST knob
             uint32_t aligned_q_len = upper_power_of_2(q_len);
             uint32_t group_sz_ph1 = std::min(std::max(aligned_q_len * xe_native_sub_group_size, 64u), 256u);
             uint32_t out_per_wg_ph1 = std::min(q_len, 256u / xe_native_sub_group_size);
@@ -8294,6 +8294,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     bool xe_fa_opt = false;
     bool fa_copy_qstate = false;
+    uint32_t xe_ph2_split = 1;
     bool xe_fa_supported_platform =
         (ctx->device.get()->architecture == INTEL_XE2 && ctx->device.get()->properties.deviceID != 0xFD80 && ctx->device.get()->properties.deviceID != 0xFD81) ||
         (ctx->device.get()->architecture == INTEL_XE1 && ctx->device.get()->coopmat_support && ctx->device.get()->uma);
@@ -8388,6 +8389,24 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 fa_copy_qstate = false;
             } else {
                 size_p = neq1 * neq2 * p_dim * neq3 * sizeof(ggml_fp16_t);
+
+                // Decode phase 2 has only (HSV / out_dim) x kv_heads workgroups and loops over the whole KV range.
+                // Split the KV range so the GPU is filled; fa_split_k_reduce merges the partial results.
+                {
+                    uint32_t gqa_pow2 = 1;
+                    while (gqa_pow2 < qk_ratio) gqa_pow2 <<= 1;
+                    const uint32_t out_dim = qk_ratio > 16 ? 8 : 16;
+                    const uint32_t out_per_wg = std::min(std::max(16u / gqa_pow2, 1u), (uint32_t)neq1);
+                    const uint32_t base_wgs = CEIL_DIV((uint32_t)neq1, out_per_wg) * ((uint32_t)ne0 / out_dim) * (uint32_t)nev2 * (uint32_t)neq3;
+                    const uint32_t loops = CEIL_DIV((uint32_t)nek1, 256u);
+                    uint32_t s = std::max(1u, shader_core_count * 16 / std::max(1u, base_wgs));
+                    s = std::min(s, std::max(1u, loops / 4));
+                    if (const char * e = getenv("GGML_VK_XE_FA_PH2_SPLIT")) { // TEST knob
+                        s = std::max(1, atoi(e));
+                    }
+                    s = std::min(s, loops);
+                    xe_ph2_split = CEIL_DIV(loops, CEIL_DIV(loops, s));
+                }
                 size_group_max = neq1 * neq2 * max_dim * neq3 * sizeof(float);
                 size_t temp_size = ggml_nelements(q) * sizeof(ggml_fp16_t) + size_p + size_group_max;
                 fa_copy_qstate = true;
@@ -8411,7 +8430,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
     // For matrices, the order is (inner to outer) [HSV, ne1, k, ne2, ne3].
     // For L/M, the order is (inner to outer) [ne1, k, ne2, ne3].
-    const uint64_t split_k_size = split_k > 1 ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k * ne2 * ne3 : 0;
+    const uint32_t split_k_alloc = std::max(split_k, xe_ph2_split);
+    const uint64_t split_k_size = split_k_alloc > 1 ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k_alloc * ne2 * ne3 : 0;
     if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested preallocation size is too large");
     }
@@ -8578,7 +8598,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             return ret + 1;
         };
         auto to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, q->type);
-        const uint32_t out_dim_per_wg = qk_ratio > 16 ? 8 : 16;
+        const uint32_t out_dim_per_wg = getenv("GGML_VK_XE_FA_VDIM") ? (uint32_t) atoi(getenv("GGML_VK_XE_FA_VDIM")) : (qk_ratio > 16 ? 8 : 16); // TEST knob
         size_t x_ne = ggml_nelements(q);
         size_t temp_buf_offset = 0;
         uint32_t head_stride_k = uint32_t(nbk2 / ggml_type_size(k->type));
@@ -8593,6 +8613,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         vk_fa_xe_opt_push_constants pc_ph2 = pc_ph1;
         pc_ph2.nbkv_tok = v_stride;
         pc_ph2.nbkv_head = head_stride_v;
+        pc_ph2.qk_sub_groups = xe_ph2_split; // phase 2 reads it as kvSplits
         vk_subbuffer q_temp_buf = fa_copy_qstate ? ggml_vk_subbuffer(ctx, ctx->prealloc_x, temp_buf_offset) : q_buf;
         temp_buf_offset += fa_copy_qstate ? x_ne * sizeof(ggml_fp16_t) : 0;
         vk_subbuffer p_temp_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_x, temp_buf_offset);
@@ -8613,17 +8634,33 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { q_buf, q_temp_buf }, pc_cpy_fp16, { (uint32_t)(x_ne), 1, 1 });
         }
 
+        // TEST ONLY (wrong output, timing): GGML_VK_XE_FA_SKIP=1 skips phase 1, =2 skips phase 2
+        const char * xe_skip = getenv("GGML_VK_XE_FA_SKIP");
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline_dual_phases.first, 1);
+        if (!xe_skip || atoi(xe_skip) != 1)
         ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline_dual_phases.first,
             { q_temp_buf, k_buf, mask_buf, p_temp_buf, max_temp_buf },
             pc_ph1, { (uint32_t)ph1_wg, (uint32_t)nek1, (uint32_t)neq3 });
 
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline_dual_phases.second, 1);
+        vk_subbuffer split_k_buf = xe_ph2_split > 1 ? ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0) : dst_buf;
+        if (xe_ph2_split > 1) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+        }
+        if (!xe_skip || atoi(xe_skip) != 2)
         ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline_dual_phases.second,
-            { p_temp_buf, v_buf, max_temp_buf, sinks_buf, dst_buf },
-            pc_ph2, { (uint32_t)ph2_wg, (uint32_t)nev2, (uint32_t)neq3 });
+            { p_temp_buf, v_buf, max_temp_buf, sinks_buf, split_k_buf },
+            pc_ph2, { (uint32_t)ph2_wg * xe_ph2_split, (uint32_t)nev2, (uint32_t)neq3 });
+        if (xe_ph2_split > 1) {
+            ggml_vk_sync_buffers(ctx, subctx);
+            const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, xe_ph2_split, (sinks != nullptr) };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                                        {split_k_buf, sinks_buf, dst_buf},
+                                        pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
+            ctx->prealloc_split_k_need_sync = true;
+        }
 
         ctx->prealloc_x_need_sync = true;
     } else if (split_k > 1) {
