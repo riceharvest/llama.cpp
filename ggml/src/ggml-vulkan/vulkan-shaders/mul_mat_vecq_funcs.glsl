@@ -84,12 +84,19 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const vec2 dma, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_Q5_0)
-// 2-byte loads for Q5_0 blocks (22 bytes)
+// Q5_0 blocks are 22 bytes, so qh/qs are only 2-byte aligned. Read them with 32-bit loads.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
+uint32_t load_a_4b(const uint byte_offset) {
+    const uint w = byte_offset / 4;
+    if ((byte_offset & 2) == 0) {
+        return data_a_u32[w];
+    }
+    return (data_a_u32[w] >> 16) | (data_a_u32[w + 1] << 16);
+}
+
 i32vec2 repack(uint ib, uint iqs) {
-    const u16vec2 quants = u16vec2(data_a_packed16[ib].qs[iqs * 2    ],
-                                   data_a_packed16[ib].qs[iqs * 2 + 1]);
-    const uint32_t vui = pack32(quants);
-    const int32_t qh = int32_t((uint32_t(data_a_packed16[ib].qh[1]) << 16 | data_a_packed16[ib].qh[0]) >> (4 * iqs));
+    const uint32_t vui = load_a_4b(ib * 22 + 6 + iqs * 4);
+    const int32_t qh = int32_t(load_a_4b(ib * 22 + 2) >> (4 * iqs));
     const int32_t v0 = int32_t(vui & 0x0F0F0F0F)
                      | ((qh & 0xF) * 0x02040810) & 0x10101010; // (0,1,2,3) -> (4,12,20,28)
 
@@ -126,10 +133,15 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const vec2 dma, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_Q8_0)
-// 2-byte loads for Q8_0 blocks (34 bytes)
+// Q8_0 blocks are 34 bytes, so qs is only 2-byte aligned. Read it with 32-bit loads.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
 int32_t repack(uint ib, uint iqs) {
-    return pack32(i16vec2(data_a_packed16[ib].qs[iqs * 2    ],
-                          data_a_packed16[ib].qs[iqs * 2 + 1]));
+    const uint byte_offset = ib * 34 + 2 + iqs * 4;
+    const uint w = byte_offset / 4;
+    if ((byte_offset & 2) == 0) {
+        return int32_t(data_a_u32[w]);
+    }
+    return int32_t((data_a_u32[w] >> 16) | (data_a_u32[w + 1] << 16));
 }
 
 FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
@@ -138,12 +150,13 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_MXFP4)
-// 1-byte loads for mxfp4 blocks (17 bytes)
+// mxfp4 blocks are 17 bytes, so qs has any byte alignment. Read it with 32-bit loads.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
 i32vec2 repack(uint ib, uint iqs) {
-    const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
-                                      data_a[ib].qs[iqs * 4 + 1],
-                                      data_a[ib].qs[iqs * 4 + 2],
-                                      data_a[ib].qs[iqs * 4 + 3]));
+    const uint byte_offset = ib * 17 + 1 + iqs * 4;
+    const uint w = byte_offset / 4;
+    const uint shift = (byte_offset & 3) * 8;
+    const uint32_t qs = shift == 0 ? data_a_u32[w] : (data_a_u32[w] >> shift) | (data_a_u32[w + 1] << (32 - shift));
 
     const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
     const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
