@@ -3224,7 +3224,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             uint32_t split_p_per_warp = 16;
             uint32_t group_sz_ph2 = (split_p_per_iter_ph2 / split_p_per_warp) * xe_native_sub_group_size;
             uint32_t out_per_wg_ph2 = std::min(std::max(16u / aligned_gqa_ratio, 1u), q_len);
-            ggml_vk_create_pipeline(device, pipelines.first, "xe_fa_decode_ph1", fa_decode_ph1_cm1_len, fa_decode_ph1_cm1_data, "main", 5, sizeof(vk_fa_xe_opt_push_constants), { 1, 32, 1 }, { group_sz_ph1, gqa_ratio, head_dim_qk, xe_native_sub_group_size, split_p_chunk, out_per_wg_ph1 }, 1, false, true, xe_native_sub_group_size);
+            // phase 1: each workgroup handles ph1_chunks consecutive chunks of split_p_chunk KV rows (test knob for now)
+            static const uint32_t ph1_chunks = [] {
+                const char * e = getenv("GGML_VK_XE_FA_PH1_CHUNKS");
+                const int v = e ? atoi(e) : 1;
+                return (uint32_t) std::min(std::max(v, 1), 64);
+            }();
+            const uint32_t coop_mat_p_per_loop = 4; // spec constant 6, its shader default; listed so constant 7 can be set
+            ggml_vk_create_pipeline(device, pipelines.first, "xe_fa_decode_ph1", fa_decode_ph1_cm1_len, fa_decode_ph1_cm1_data, "main", 5, sizeof(vk_fa_xe_opt_push_constants), { 1, split_p_chunk * ph1_chunks, 1 }, { group_sz_ph1, gqa_ratio, head_dim_qk, xe_native_sub_group_size, split_p_chunk, out_per_wg_ph1, coop_mat_p_per_loop, ph1_chunks }, 1, false, true, xe_native_sub_group_size);
             ggml_vk_create_pipeline(device, pipelines.second, "xe_fa_decode_ph2", fa_decode_ph2_cm1_len, fa_decode_ph2_cm1_data, "main", 5, sizeof(vk_fa_xe_opt_push_constants), { 1, 1, 1 }, { group_sz_ph2, gqa_ratio, head_dim_pv, out_per_wg_ph2, xe_native_sub_group_size, split_p_per_iter_ph2, split_p_chunk, out_dim_per_wg }, 1, false, true, xe_native_sub_group_size);
         }
     }
