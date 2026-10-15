@@ -10886,6 +10886,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // small batches (e.g. a speculative-decoding verify batch): 2..MMVQ_MAX_BATCH_SIZE (8) tokens with top-2 routing out of
+    // 8 experts take the per-token mat-vec path on SYCL; 9 is the first size past it
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {2, 3, 4, 7, 8, 9}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 512, n, 256));
+        }
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {
