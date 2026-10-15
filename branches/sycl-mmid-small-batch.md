@@ -15,3 +15,18 @@ decode. Dense mat-muls still differ between 1 token (ESIMD DMMV) and 2-8 tokens 
 
 Status: compile-checked; B70 test pending (MUL_MAT_ID test-backend-ops, MTP speed and greedy identity).
 Evidence: the divergence analysis in the 001 test notes (b70-code, 2026-10-15).
+
+## Result on the B70 (testq 007, 2026-10-15)
+
+Qwen3.6-35B-A3B-MTP UD-Q4_K_M, llama-server, greedy, 3 prompts x 256 tokens:
+
+| arm | tok/s (mean of 3 prompts) |
+|---|---|
+| master, no MTP (two processes) | 88.5 / 85.6 |
+| branch, no MTP | 83.9 |
+| **branch, MTP n=3** | **131.8** (master MTP n=3 in testq 001: 80.9) |
+| branch, MTP n=3, `GGML_SYCL_ENABLE_ESIMD=0` | 121.7 |
+
+Open: output differs from master without MTP on 2 of 3 prompts (llama-server runs the last 4 prompt tokens as a separate
+batch for its context checkpoint, and that batch now takes this path); MTP output differs from no-MTP output; test-backend-ops
+`-o MUL_MAT_ID` aborted in the f32 oneDNN path after 34 cases (whether master does the same is not yet checked).

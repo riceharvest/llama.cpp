@@ -37,3 +37,20 @@ The lab's runtime settings for its result: `UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=
 
 Status: compile-checked; B70 measurement pending (correctness vs master greedy output, tg128). Build like any SYCL build
 (`-DGGML_SYCL=ON -DGGML_SYCL_F16=ON -DGGML_SYCL_DEVICE_ARCH=bmg-g31-a0`), then set all flags and run `llama-bench`.
+
+## Result on the B70 (testq 006, 2026-10-15)
+
+Qwen3.6-35B-A3B UD-Q4_K_M, tg128, r=2, all arms back to back:
+
+| arm | tok/s |
+|---|---|
+| master | 93.39 ± 0.19 |
+| master + lab runtime settings (`UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1 GGML_SYCL_ENABLE_GRAPH=0`) | 93.48 ± 0.10 |
+| branch, flags off | 93.36 ± 0.05 |
+| **branch, all flags on** | **107.92 ± 1.47 (+15.5%)** |
+
+Greedy 128 tokens on 2 prompts, master vs branch with all flags on: identical. Hits: moe_gate_up, moe_gate_residual_rms,
+residual_rms_norm 10280 each; concat_state, gdn_rms_gate 7710; qk_norm_rope 2570. Zero hits: moe_shared_residual_rms (by
+design: moe_gate_residual_rms covers the same nodes when the shared-expert gate is a sigmoid), concat_state_direct and
+gdn_state_io (their matchers do not fit master's graph; under investigation). `GGML_SYCL_ENABLE_GRAPH` has no effect here:
+it is off by default and graphs are disabled for any graph with MUL_MAT_ID.
