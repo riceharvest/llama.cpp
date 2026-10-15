@@ -1179,6 +1179,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     static const bool allow_gqa_opt = ggml_sycl_get_env("GGML_SYCL_FA_TILE_GQA_OPT", 1) != 0;  // test knob
+    static const bool pad_gqa       = ggml_sycl_get_env("GGML_SYCL_FA_TILE_GQA_PAD", 0) != 0;  // test knob
     const bool use_gqa_opt = allow_gqa_opt && mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DV == 512) {
@@ -1212,7 +1213,19 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
             return;
         }
 
+        // Pad the Q heads of a K/V head up to the next tile width: each K/V head is then read once per block instead
+        // of gqa_ratio / 2 times (GQA 6: once instead of 3 times), for 2 idle columns of compute.
+        if (pad_gqa && use_gqa_opt && gqa_ratio > 4) {
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+            return;
+        }
+
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
+            return;
+        }
+
+        if (pad_gqa && use_gqa_opt && gqa_ratio > 2) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
             return;
         }
