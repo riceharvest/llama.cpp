@@ -5892,6 +5892,16 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
 
+        // Xe2: with only a few large tiles per core (e.g. FFN down projections at n=512), splitting a long k still pays off
+        if (ctx->device->architecture == vk_device_architecture::INTEL_XE2 && k >= 6144 &&
+            m_tiles * n_tiles > ctx->device->shader_core_count * 2 / 3 && m_tiles * n_tiles <= ctx->device->shader_core_count * 6) {
+            split_k = k >= 12288 ? 4 : 2;
+            while (split_k > 1 && ROUNDUP_POW2(CEIL_DIV(k, split_k), 256) * (split_k - 1) >= k) {
+                split_k--;
+            }
+            return split_k;
+        }
+
         if (k >= 2048) {
             if (m_tiles * n_tiles <= ctx->device->shader_core_count / 2) {
                 split_k = ctx->device->shader_core_count / (m_tiles * n_tiles);
