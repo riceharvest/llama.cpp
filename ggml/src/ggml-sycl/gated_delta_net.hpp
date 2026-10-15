@@ -9,6 +9,7 @@
 struct ggml_sycl_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
     int64_t slot_stride; // between rollback slots (0 when K==1)
+    const float * input_data = nullptr; // optional persistent state read in place
 };
 
 void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst);

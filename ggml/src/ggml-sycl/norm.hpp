@@ -25,6 +25,22 @@ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context& ctx, ggml_tens
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul_tensor, ggml_tensor* add_tensor);
 
+void ggml_sycl_op_qwen35moe_gdn_rms_silu_gate_fused(
+        ggml_backend_sycl_context& ctx, ggml_tensor* rms_norm,
+        ggml_tensor* weight_mul, ggml_tensor* silu, ggml_tensor* gate_mul);
+
+void ggml_sycl_op_residual_rms_norm_fused(
+        ggml_backend_sycl_context& ctx, ggml_tensor* add, ggml_tensor* rms_norm, ggml_tensor* mul);
+
+void ggml_sycl_op_moe_shared_residual_rms_norm_fused(
+        ggml_backend_sycl_context& ctx, ggml_tensor* ffn_add,
+        ggml_tensor* residual_add, ggml_tensor* rms_norm, ggml_tensor* mul);
+
+void ggml_sycl_op_moe_shared_gate_residual_rms_norm_fused(
+        ggml_backend_sycl_context& ctx, ggml_tensor* gate_sigmoid,
+        ggml_tensor* shared_gated, ggml_tensor* ffn_add,
+        ggml_tensor* residual_add, ggml_tensor* rms_norm, ggml_tensor* mul);
+
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
 void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
