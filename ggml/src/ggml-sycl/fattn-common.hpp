@@ -903,6 +903,27 @@ static void lauch_kernel(
     });
 }
 
+// Cores and resident work-groups per core, used to size the KV split (parallel_blocks). The generic numbers are
+// CUDA-shaped: nsm = compute units / 16 and max_wg_per_cu = max work-group size / compute units. An Xe2 core has 8 XVEs
+// with 8 hardware threads each (4 with the large register file), so the device has compute units / 8 cores and a core
+// holds 64 / nwarps work-groups of nwarps sub-groups, or fewer when local memory runs out. With the generic numbers a
+// 32-core Arc Pro B70 ran long-context decode as one wave of 64 work-groups.
+static inline void ggml_sycl_fattn_occupancy(const int id, const int nwarps, const size_t nbytes_shared, const bool large_grf,
+                                             int & n_cores, int & blocks_per_core) {
+    const sycl_device_info & info = ggml_sycl_info().devices[id];
+    n_cores         = info.nsm;
+    blocks_per_core = info.max_wg_per_cu;
+
+    const gpu_arch arch = info.hw_info.arch;
+    if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 || arch == gpu_arch::intel_gpu_lnl_m) {
+        n_cores         = std::max(1, 2 * info.nsm);
+        blocks_per_core = std::max(1, (large_grf ? 32 : 64) / std::max(1, nwarps));
+        if (nbytes_shared > 0) {
+            blocks_per_core = std::min<int>(blocks_per_core, std::max<size_t>(1, info.smpbo / nbytes_shared));
+        }
+    }
+}
+
 // use_large_grf lets the compiler choose the large register file. Opt in where spilling limits the kernel, not thread occupancy.
 template <int DV, int ncols1, int ncols2, fattn_kernel_t fattn_kernel, int warp_size, bool use_large_grf = false>
 void launch_fattn(
@@ -1075,6 +1096,12 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
+        // The search starts from the old value, so launches with enough tiles to fill the device are unchanged;
+        // only the wave it tries to fill is sized from the real occupancy.
+        int n_cores = nsm;
+        int blocks_per_core = max_blocks_per_sm;
+        ggml_sycl_fattn_occupancy(id, nwarps, nbytes_shared, use_large_grf, n_cores, blocks_per_core);
+
         const int ntiles_KQ = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by tensor size.
 
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1084,7 +1111,7 @@ void launch_fattn(
 
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
+        const int blocks_per_wave = n_cores * blocks_per_core;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
