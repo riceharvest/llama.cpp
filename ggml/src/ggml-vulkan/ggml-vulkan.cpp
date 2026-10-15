@@ -7959,7 +7959,6 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
 }
 
 bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
-    GGML_UNUSED(f32acc);
     // Needs to be kept up to date on shader changes
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Br = params.block_rows;
@@ -7972,7 +7971,9 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
 
     // tmpsh is overestimated slightly
     const uint32_t tmpsh = wg_size * sizeof(float);
-    const uint32_t tmpshv4 = wg_size * 4 * float_type_size;
+    // O (and its cross-thread reduction buffer tmpshv4) uses ACC_TYPE: fp32 unless f16acc on an fp16 device
+    const uint32_t o_type_size = f32acc ? sizeof(float) : float_type_size;
+    const uint32_t tmpshv4 = wg_size * 4 * o_type_size;
 
     const uint32_t masksh = Bc * (Br + 1) * float_type_size;
     // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.

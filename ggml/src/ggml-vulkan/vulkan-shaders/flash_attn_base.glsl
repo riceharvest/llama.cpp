@@ -97,6 +97,10 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 #if defined(BFLOAT16)
 #define O_TYPE float
 #define O_TYPEV4 vec4
+#elif defined(FA_O_USE_ACC_TYPE)
+// Scalar shader: accumulate O in ACC_TYPE (fp32 for f32acc / GGML_PREC_F32, fp16 for f16acc)
+#define O_TYPE ACC_TYPE
+#define O_TYPEV4 ACC_TYPEV4
 #else
 #define O_TYPE FLOAT_TYPE
 #define O_TYPEV4 FLOAT_TYPEV4
