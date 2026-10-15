@@ -649,3 +649,182 @@ void ggml_sycl_rope_fused(ggml_backend_sycl_context &ctx, ggml_tensor *rope,
     scope_op_debug_print scope_dbg_print(__func__, rope, /*num_src=*/3);
     ggml_sycl_op_rope_impl<true>(ctx, rope, set_rows);
 }
+
+void ggml_sycl_ornith_rms_mul_rope_qk_fused(
+        ggml_backend_sycl_context & ctx,
+        ggml_tensor * q_rms, ggml_tensor * q_mul, ggml_tensor * q_rope,
+        ggml_tensor * k_rms, ggml_tensor * k_mul, ggml_tensor * k_rope,
+        ggml_tensor * k_set_rows) {
+    GGML_ASSERT(q_rms != nullptr && q_mul != nullptr && q_rope != nullptr);
+    GGML_ASSERT(k_rms != nullptr && k_mul != nullptr && k_rope != nullptr && k_set_rows != nullptr);
+    GGML_ASSERT(q_rms->op == GGML_OP_RMS_NORM && q_mul->op == GGML_OP_MUL && q_rope->op == GGML_OP_ROPE);
+    GGML_ASSERT(k_rms->op == GGML_OP_RMS_NORM && k_mul->op == GGML_OP_MUL && k_rope->op == GGML_OP_ROPE);
+    GGML_ASSERT(q_rope->src[0] == q_mul && k_rope->src[0] == k_mul);
+    GGML_ASSERT((q_mul->src[0] == q_rms) != (q_mul->src[1] == q_rms));
+    GGML_ASSERT((k_mul->src[0] == k_rms) != (k_mul->src[1] == k_rms));
+
+    const ggml_tensor * q_src_tensor = q_rms->src[0];
+    const ggml_tensor * k_src_tensor = k_rms->src[0];
+    const ggml_tensor * q_weight_tensor = q_mul->src[0] == q_rms ? q_mul->src[1] : q_mul->src[0];
+    const ggml_tensor * k_weight_tensor = k_mul->src[0] == k_rms ? k_mul->src[1] : k_mul->src[0];
+    GGML_ASSERT(q_src_tensor != nullptr && k_src_tensor != nullptr);
+    GGML_ASSERT(q_weight_tensor != nullptr && k_weight_tensor != nullptr);
+    GGML_ASSERT(q_src_tensor->type == GGML_TYPE_F32 && k_src_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_weight_tensor->type == GGML_TYPE_F32 && k_weight_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_rope->type == GGML_TYPE_F32 && k_rope->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_src_tensor->ne[0] == 256 && q_src_tensor->ne[1] == 16 &&
+                q_src_tensor->ne[2] == 1 && q_src_tensor->ne[3] == 1);
+    GGML_ASSERT(k_src_tensor->ne[0] == 256 && k_src_tensor->ne[1] == 2 &&
+                k_src_tensor->ne[2] == 1 && k_src_tensor->ne[3] == 1);
+    GGML_ASSERT(q_weight_tensor->ne[0] == 256 && ggml_nelements(q_weight_tensor) == 256);
+    GGML_ASSERT(k_weight_tensor->ne[0] == 256 && ggml_nelements(k_weight_tensor) == 256);
+    GGML_ASSERT(q_src_tensor->nb[0] == sizeof(float) && k_src_tensor->nb[0] == sizeof(float));
+    GGML_ASSERT(q_weight_tensor->nb[0] == sizeof(float) && k_weight_tensor->nb[0] == sizeof(float));
+    GGML_ASSERT(q_rope->nb[0] == sizeof(float));
+    GGML_ASSERT(k_set_rows->type == GGML_TYPE_F16 && k_set_rows->src[1] != nullptr &&
+                k_set_rows->src[1]->type == GGML_TYPE_I64);
+    GGML_ASSERT(q_rope->src[1] != nullptr && q_rope->src[1] == k_rope->src[1] &&
+                q_rope->src[1]->type == GGML_TYPE_I32);
+
+    float q_eps = 0.0f;
+    float k_eps = 0.0f;
+    memcpy(&q_eps, q_rms->op_params, sizeof(float));
+    memcpy(&k_eps, k_rms->op_params, sizeof(float));
+    GGML_ASSERT(q_eps >= 0.0f && q_eps == k_eps);
+
+    const int32_t * ip = (const int32_t *) q_rope->op_params;
+    GGML_ASSERT(memcmp(q_rope->op_params, k_rope->op_params, GGML_MAX_OP_PARAMS) == 0);
+    GGML_ASSERT(ip[1] == 64 && ip[2] == GGML_ROPE_TYPE_IMROPE && ip[4] == 262144);
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base,   ip + 5,  sizeof(float));
+    memcpy(&freq_scale,  ip + 6,  sizeof(float));
+    memcpy(&ext_factor,  ip + 7,  sizeof(float));
+    memcpy(&attn_factor, ip + 8,  sizeof(float));
+    memcpy(&beta_fast,   ip + 9,  sizeof(float));
+    memcpy(&beta_slow,   ip + 10, sizeof(float));
+    GGML_ASSERT(freq_base == 10000000.0f && freq_scale == 1.0f &&
+                ext_factor == 0.0f && attn_factor == 1.0f);
+
+    mrope_sections sections;
+    memcpy(&sections.v, ip + 11, sizeof(sections.v));
+    GGML_ASSERT(sections.v[0] == 11 && sections.v[1] == 11 &&
+                sections.v[2] == 10 && sections.v[3] == 0);
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(ip[1], ip[4], freq_base, beta_fast, beta_slow, corr_dims.v);
+    const float theta_scale = powf(freq_base, -2.0f / ip[1]);
+
+    const float * q_src = (const float *) q_src_tensor->data;
+    const float * k_src = (const float *) k_src_tensor->data;
+    const float * q_weight = (const float *) q_weight_tensor->data;
+    const float * k_weight = (const float *) k_weight_tensor->data;
+    float * q_dst = (float *) q_rope->data;
+    sycl::half * k_dst = (sycl::half *) k_set_rows->data;
+    const int32_t * pos = (const int32_t *) q_rope->src[1]->data;
+    const int64_t * row_indices = (const int64_t *) k_set_rows->src[1]->data;
+
+    const int q_s01 = q_src_tensor->nb[1] / sizeof(float);
+    const int k_s01 = k_src_tensor->nb[1] / sizeof(float);
+    const int q_d01 = q_rope->nb[1] / sizeof(float);
+    const int k_set_rows_stride = k_set_rows->nb[1] / sizeof(sycl::half);
+    static const bool poison_q = [] {
+        const char * value = getenv("GGML_SYCL_FUSED_ORNITH_QK_NORM_ROPE_POISON");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    const bool poison_q_kernel = poison_q;
+
+    constexpr int q_rows = 16;
+    constexpr int k_rows = 2;
+    constexpr int rms_lanes = WARP_SIZE;
+    constexpr int rope_pairs = 128;
+    const dpct::dim3 block_dims(1, rms_lanes, 1);
+    const dpct::dim3 block_nums(q_rows + k_rows, 1, 1);
+    dpct::queue_ptr stream = ctx.stream();
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> rms_mul_acc(sycl::range<1>(256), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1)
+            [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const int row = item_ct1.get_group(2);
+                const int tid = item_ct1.get_local_id(1);
+                const bool is_q = row < q_rows;
+                const int local_row = is_q ? row : row - q_rows;
+                const float * src = is_q ? q_src + local_row * q_s01 : k_src + local_row * k_s01;
+                const float * weight = is_q ? q_weight : k_weight;
+
+                float sum = 0.0f;
+                for (int col = tid; col < 256; col += rms_lanes) {
+                    const float value = src[col];
+                    sum += value * value;
+                }
+                sum = warp_reduce_sum(sum, item_ct1);
+                const float scale = sycl::rsqrt(sum / 256.0f + q_eps);
+
+                for (int col = tid; col < 256; col += rms_lanes) {
+                    rms_mul_acc[col] = scale * src[col] * weight[col];
+                }
+                item_ct1.barrier(sycl::access::fence_space::local_space);
+
+                for (int pair = tid; pair < rope_pairs; pair += rms_lanes) {
+                    const int i0 = 2 * pair;
+                    int col0;
+                    int col1;
+                    int out0;
+                    int out1;
+                    if (i0 < 64) {
+                        col0 = i0 / 2;
+                        col1 = col0 + 32;
+                        out0 = col0;
+                        out1 = col1;
+                    } else {
+                        col0 = i0;
+                        col1 = i0 + 1;
+                        out0 = col0;
+                        out1 = col1;
+                    }
+
+                    const float x0 = rms_mul_acc[col0];
+                    const float x1 = rms_mul_acc[col1];
+                    float y0 = x0;
+                    float y1 = x1;
+
+                    if (i0 < 64) {
+                        const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+                        const int sector = (i0 / 2) % sect_dims;
+                        float theta_base;
+                        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {
+                            theta_base = pos[1] * dpct::pow(theta_scale, i0 / 2.0f);
+                        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {
+                            theta_base = pos[2] * dpct::pow(theta_scale, i0 / 2.0f);
+                        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {
+                            theta_base = pos[0] * dpct::pow(theta_scale, i0 / 2.0f);
+                        } else {
+                            theta_base = pos[3] * dpct::pow(theta_scale, i0 / 2.0f);
+                        }
+                        float cos_theta;
+                        float sin_theta;
+                        rope_yarn<true>(theta_base, freq_scale, corr_dims, i0,
+                                        ext_factor, attn_factor, cos_theta, sin_theta);
+                        y0 = x0 * cos_theta - x1 * sin_theta;
+                        y1 = x0 * sin_theta + x1 * cos_theta;
+                    }
+
+                    if (is_q) {
+                        q_dst[local_row * q_d01 + out0] = poison_q_kernel ? 0.0f : y0;
+                        q_dst[local_row * q_d01 + out1] = poison_q_kernel ? 0.0f : y1;
+                    } else {
+                        const int base = row_indices[0] * k_set_rows_stride + local_row * 256;
+                        k_dst[base + out0] = ggml_sycl_cast<sycl::half>(y0);
+                        k_dst[base + out1] = ggml_sycl_cast<sycl::half>(y1);
+                    }
+                }
+            });
+    });
+}

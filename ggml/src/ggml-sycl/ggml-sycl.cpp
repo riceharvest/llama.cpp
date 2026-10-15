@@ -59,6 +59,7 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/concat.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
@@ -5298,7 +5299,7 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
     return ggml_sycl_mul_mat_vec_q_glu_reorder(wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
                                                (float *) glu->data, (int) ne00, (int) wu->ne[1], (int) ne11,
                                                /*stride_col_y_bytes=*/src1_padded_cols * (int) sizeof(block_q8_1) /
-                                                   QK8_1,
+                                               QK8_1,
                                                /*stride_col_dst=*/(int) glu->ne[0], stream);
 }
 
@@ -5373,6 +5374,123 @@ static int ggml_sycl_l2_norm_batch_fused(ggml_backend_sycl_context & ctx, ggml_c
     return last - node_idx;
 }
 
+
+static std::atomic<uint64_t> g_ggml_sycl_ornith_moe_gate_up_hits{0};
+
+static bool ggml_sycl_ornith_moe_gate_up_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_MOE_GATE_UP");
+        const bool on = value != nullptr && std::atoi(value) != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr, "ggml_sycl_ornith_moe_gate_up: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_moe_gate_up_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_ornith_moe_projection(
+        const ggml_tensor * projection, const ggml_tensor * input,
+        const ggml_tensor * ids, const char * weight_name) {
+    const ggml_tensor * weight = projection != nullptr ? projection->src[0] : nullptr;
+    return projection != nullptr && projection->op == GGML_OP_MUL_MAT_ID &&
+           (projection->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+           (projection->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+           projection->src[1] == input && projection->src[2] == ids &&
+           projection->type == GGML_TYPE_F32 &&
+           projection->ne[0] == 512 && projection->ne[1] == 8 &&
+           projection->ne[2] == 1 && projection->ne[3] == 1 &&
+           ggml_is_contiguous(projection) && weight != nullptr &&
+           std::strcmp(weight->name, weight_name) == 0 &&
+           weight->type == GGML_TYPE_Q4_K && weight->ne[0] == 2048 &&
+           weight->ne[1] == 512 && weight->ne[2] == 256 && weight->ne[3] == 1 &&
+           ggml_is_contiguous(weight) && !ggml_backend_buffer_is_sycl_split(weight->buffer);
+}
+
+static bool ggml_sycl_ornith_moe_gate_up_fused(
+        ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_ornith_moe_gate_up_enabled() ||
+        !g_ggml_sycl_enable_optimize || !ctx.opt_feature.reorder ||
+        node_idx < 0 || node_idx + 2 >= cgraph->n_nodes ||
+        !ggml_can_fuse_subgraph(cgraph, node_idx,
+            { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { node_idx + 2 })) {
+        return false;
+    }
+
+    ggml_tensor * first = cgraph->nodes[node_idx];
+    ggml_tensor * second = cgraph->nodes[node_idx + 1];
+    ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+    if (glu == nullptr || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 ||
+        glu->ne[0] != 512 || glu->ne[1] != 8 || glu->ne[2] != 1 || glu->ne[3] != 1 ||
+        !ggml_is_contiguous(glu)) {
+        return false;
+    }
+
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up = glu->src[1];
+    if (!((gate == first && up == second) || (gate == second && up == first))) {
+        return false;
+    }
+    const ggml_tensor * input = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+    if (input == nullptr || ids == nullptr || gate->src[1] != input || gate->src[2] != ids ||
+        input->type != GGML_TYPE_F32 || input->ne[0] != 2048 || input->ne[1] != 1 ||
+        input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
+        ids->type != GGML_TYPE_I32 || ids->ne[0] != 8 || ids->ne[1] != 1 ||
+        !ggml_is_contiguous(ids)) {
+        return false;
+    }
+
+    int layer = -1;
+    const ggml_tensor * gate_weight = gate->src[0];
+    if (gate_weight == nullptr ||
+        std::sscanf(gate_weight->name, "blk.%d.ffn_gate_exps.weight", &layer) != 1 ||
+        layer < 0 || layer >= 40) {
+        return false;
+    }
+    char gate_name[64];
+    char up_name[64];
+    std::snprintf(gate_name, sizeof(gate_name), "blk.%d.ffn_gate_exps.weight", layer);
+    std::snprintf(up_name, sizeof(up_name), "blk.%d.ffn_up_exps.weight", layer);
+    if (!ggml_sycl_ornith_moe_projection(gate, input, ids, gate_name) ||
+        !ggml_sycl_ornith_moe_projection(up, input, ids, up_name) ||
+        !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+        !ggml_are_same_stride(gate->src[0], up->src[0])) {
+        return false;
+    }
+
+    opt_for_reorder_id(&ctx, gate->src[0]);
+    opt_for_reorder_id(&ctx, up->src[0]);
+    const auto * gate_extra = static_cast<const ggml_tensor_extra_gpu *>(gate->src[0]->extra);
+    const auto * up_extra = static_cast<const ggml_tensor_extra_gpu *>(up->src[0]->extra);
+    if (gate_extra == nullptr || up_extra == nullptr ||
+        !gate_extra->optimized_feature.reorder || !up_extra->optimized_feature.reorder) {
+        return false;
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/3, " : fused with gate + routed GLU");
+    const queue_ptr stream = ctx.stream();
+    constexpr int ncols = 2048;
+    const int padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> input_q8(ctx.pool(),
+        (size_t) padded * sizeof(block_q8_1) / QK8_1);
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) input->data, input_q8.get(), ncols, 1, padded, stream);
+
+    const bool ok = ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+        up->src[0]->type, ggml_get_glu_op(glu), up->src[0]->data,
+        gate->src[0]->data, input_q8.get(), (const int32_t *) ids->data,
+        (float *) glu->data, ncols, 512, 8, up->src[0]->nb[2], glu->nb[1],
+        /*src1_row_stride=*/0, stream);
+    if (ok) {
+        g_ggml_sycl_ornith_moe_gate_up_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
+}
 
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
@@ -6335,6 +6453,291 @@ static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+struct ggml_sycl_moe_add_reduce_match {
+    ggml_tensor * weighted;
+    ggml_tensor * dst;
+    int           nodes_to_skip;
+};
+
+static bool ggml_sycl_moe_add_reduce_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_MOE_ADD_REDUCE");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// Qwen3.5-MoE / Ornith decode materializes eight weighted expert rows, then
+// reduces them through seven serial ADD launches. Match that exact chain and
+// perform the same ordered FP32 additions in one launch. The weighted MUL is
+// intentionally left separate so its rounded outputs remain graph-visible and
+// the fused kernel contains no multiply-add contraction opportunity.
+static bool ggml_sycl_find_moe_add_reduce(
+        const ggml_cgraph * cgraph, int node_idx, ggml_sycl_moe_add_reduce_match & match) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_moe_add_reduce_enabled() ||
+        node_idx < 0 || node_idx >= cgraph->n_nodes) {
+        return false;
+    }
+
+    constexpr int n_experts = 8;
+    constexpr int n_adds = n_experts - 1;
+    int add_idxs[n_adds];
+    int found = 0;
+    int last_idx = node_idx - 1;
+
+    for (int j = node_idx; j < cgraph->n_nodes && found < n_adds; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != GGML_OP_ADD) {
+            return false;
+        }
+        add_idxs[found++] = j;
+        last_idx = j;
+    }
+    if (found != n_adds || add_idxs[0] != node_idx) {
+        return false;
+    }
+
+    const ggml_op ops[n_adds] = {
+        GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+        GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
+    };
+    if (!ggml_can_fuse_ext(cgraph, add_idxs, ops, n_adds)) {
+        return false;
+    }
+
+    ggml_tensor * first = cgraph->nodes[add_idxs[0]];
+    ggml_tensor * weighted = first->src[0] != nullptr ? first->src[0]->view_src : nullptr;
+    if (weighted == nullptr || weighted->type != GGML_TYPE_F32 ||
+        weighted->ne[1] != n_experts || weighted->ne[2] != 1 || weighted->ne[3] != 1 ||
+        !ggml_is_contiguous(weighted)) {
+        return false;
+    }
+
+    const int64_t row_len = weighted->ne[0];
+    const auto is_expert_row = [weighted, row_len](const ggml_tensor * view, int expert) {
+        return view != nullptr && view->op == GGML_OP_VIEW && view->view_src == weighted &&
+               view->view_offs == (size_t) expert * weighted->nb[1] &&
+               view->type == GGML_TYPE_F32 && ggml_nelements(view) == row_len &&
+               view->ne[0] == row_len && view->ne[1] == 1 && view->ne[2] == 1 && view->ne[3] == 1 &&
+               ggml_is_contiguous(view);
+    };
+
+    if (!is_expert_row(first->src[0], 0) || !is_expert_row(first->src[1], 1)) {
+        return false;
+    }
+    for (int expert = 2; expert < n_experts; ++expert) {
+        ggml_tensor * add = cgraph->nodes[add_idxs[expert - 1]];
+        ggml_tensor * prev = cgraph->nodes[add_idxs[expert - 2]];
+        if (add->src[0] != prev || !is_expert_row(add->src[1], expert)) {
+            return false;
+        }
+    }
+
+    ggml_tensor * dst = cgraph->nodes[add_idxs[n_adds - 1]];
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        dst->ne[0] != row_len || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+
+    match.weighted = weighted;
+    match.dst = dst;
+    match.nodes_to_skip = last_idx - node_idx;
+    return true;
+}
+
+static void ggml_sycl_moe_add_reduce(
+        ggml_backend_sycl_context & ctx, const ggml_sycl_moe_add_reduce_match & match) {
+    constexpr int n_experts = 8;
+    const float * src = static_cast<const float *>(match.weighted->data);
+    float * dst = static_cast<float *>(match.dst->data);
+    const int64_t row_len = match.weighted->ne[0];
+    const int64_t row_stride = match.weighted->nb[1] / sizeof(float);
+    const bool poison = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_MOE_ADD_REDUCE_POISON");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+
+    GGML_SYCL_DEBUG("[SYCL][OP] call %s: row_len=%lld experts=%d\n",
+                    __func__, (long long) row_len, n_experts);
+    ctx.stream()->parallel_for(sycl::range<1>((size_t) row_len), [=](sycl::id<1> id) {
+        const int64_t col = (int64_t) id[0];
+        float sum = src[col];
+#pragma unroll
+        for (int expert = 1; expert < n_experts; ++expert) {
+            sum = sum + src[(int64_t) expert * row_stride + col];
+        }
+        dst[col] = poison && col == 0 ? sum + 1.0f : sum;
+    });
+}
+
+static std::atomic<uint64_t> g_ggml_sycl_residual_rms_norm_hits{0};
+
+static bool ggml_sycl_residual_rms_norm_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_RESIDUAL_RMS_NORM");
+        const bool on = value != nullptr && std::atoi(value) != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr, "ggml_sycl_residual_rms_norm: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_residual_rms_norm_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_can_fuse_residual_rms_norm(const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_residual_rms_norm_enabled() || node_idx < 0 || node_idx + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * add = cgraph->nodes[node_idx];
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+        (add->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (rms_norm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (mul->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, node_idx + 1, 1) ||
+        (rms_norm->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+
+    if ((std::strstr(add->name, "attn_residual-") == nullptr && std::strstr(add->name, "l_out-") == nullptr) ||
+        add->type != GGML_TYPE_F32 || add->ne[0] != 2048 || add->ne[1] != 1 || add->ne[2] != 1 || add->ne[3] != 1 ||
+        !ggml_is_contiguous(add) || add->src[0] == nullptr || add->src[1] == nullptr ||
+        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1]) ||
+        !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+        return false;
+    }
+
+    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    return rms_norm->src[0] == add && rms_norm->type == GGML_TYPE_F32 && ggml_is_contiguous(rms_norm) &&
+           mul_src != nullptr && mul_src->type == GGML_TYPE_F32 && mul_src->ne[0] == 2048 &&
+           ggml_nelements(mul_src) == 2048 && ggml_is_contiguous(mul_src) && ggml_is_contiguous(mul);
+}
+
+static std::atomic<uint64_t> g_ggml_sycl_ornith_moe_shared_residual_rms_hits{0};
+
+static bool ggml_sycl_ornith_moe_shared_residual_rms_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_MOE_SHARED_RESIDUAL_RMS");
+        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr,
+                    "ggml_sycl_ornith_moe_shared_residual_rms: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_moe_shared_residual_rms_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_can_fuse_ornith_moe_shared_residual_rms(
+        const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_residual_rms_norm_enabled() ||
+        !ggml_sycl_ornith_moe_shared_residual_rms_enabled() ||
+        node_idx < 0 || node_idx + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * ffn_add = cgraph->nodes[node_idx];
+    const ggml_tensor * residual_add = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 3];
+    if (ffn_add == nullptr || residual_add == nullptr || rms_norm == nullptr || mul == nullptr ||
+        ffn_add->op != GGML_OP_ADD || residual_add->op != GGML_OP_ADD ||
+        rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+        std::strstr(ffn_add->name, "ffn_out-") == nullptr ||
+        std::strstr(residual_add->name, "l_out-") == nullptr ||
+        !ggml_node_has_n_uses(cgraph, node_idx + 2, 1) ||
+        (ffn_add->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (residual_add->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (rms_norm->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (residual_add->src[0] != ffn_add && residual_add->src[1] != ffn_add) ||
+        rms_norm->src[0] != residual_add ||
+        (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+
+    const ggml_tensor * residual_in = residual_add->src[0] == ffn_add
+        ? residual_add->src[1] : residual_add->src[0];
+    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const auto exact_vec = [](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 &&
+               t->ne[0] == 2048 && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+               ggml_is_contiguous(t);
+    };
+    return exact_vec(ffn_add) && exact_vec(ffn_add->src[0]) && exact_vec(ffn_add->src[1]) &&
+           exact_vec(residual_add) && exact_vec(residual_in) && exact_vec(rms_norm) &&
+           mul_src != nullptr && mul_src->type == GGML_TYPE_F32 && mul_src->ne[0] == 2048 &&
+           ggml_nelements(mul_src) == 2048 && ggml_is_contiguous(mul_src) &&
+           mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul);
+}
+
+static std::atomic<uint64_t> g_ggml_sycl_ornith_moe_gate_residual_rms_hits{0};
+
+static bool ggml_sycl_ornith_moe_gate_residual_rms_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_MOE_GATE_RESIDUAL_RMS");
+        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr,
+                    "ggml_sycl_ornith_moe_gate_residual_rms: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_moe_gate_residual_rms_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_can_fuse_ornith_moe_gate_residual_rms(
+        const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_sycl_ornith_moe_gate_residual_rms_enabled() ||
+        node_idx < 0 || node_idx + 5 >= cgraph->n_nodes ||
+        !ggml_sycl_can_fuse_ornith_moe_shared_residual_rms(cgraph, node_idx + 2)) {
+        return false;
+    }
+
+    const ggml_tensor * sigmoid = cgraph->nodes[node_idx];
+    const ggml_tensor * shared_gated = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * ffn_add = cgraph->nodes[node_idx + 2];
+    if (sigmoid == nullptr || shared_gated == nullptr || ffn_add == nullptr ||
+        sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+        shared_gated->op != GGML_OP_MUL ||
+        std::strstr(sigmoid->name, "shared_expert_gate_sigmoid-") == nullptr ||
+        std::strstr(shared_gated->name, "ffn_shexp_gated-") == nullptr ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        !ggml_node_has_n_uses(cgraph, node_idx + 1, 1) ||
+        (sigmoid->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (shared_gated->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (shared_gated->src[0] != sigmoid && shared_gated->src[1] != sigmoid) ||
+        (ffn_add->src[0] != shared_gated && ffn_add->src[1] != shared_gated)) {
+        return false;
+    }
+
+    const ggml_tensor * gate_in = sigmoid->src[0];
+    const ggml_tensor * shared = shared_gated->src[0] == sigmoid
+        ? shared_gated->src[1] : shared_gated->src[0];
+    const auto exact_vec = [](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 &&
+               t->ne[0] == 2048 && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+               ggml_is_contiguous(t);
+    };
+    return gate_in != nullptr && gate_in->type == GGML_TYPE_F32 &&
+           ggml_nelements(gate_in) == 1 && ggml_is_contiguous(gate_in) &&
+           sigmoid->type == GGML_TYPE_F32 && ggml_nelements(sigmoid) == 1 &&
+           ggml_is_contiguous(sigmoid) && exact_vec(shared) && exact_vec(shared_gated);
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 // returns the number of following nodes to skip (0 = no fusion)
@@ -6405,11 +6808,676 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    fused_state_cpy.input_data  = nullptr;
     return skip;
+}
+
+struct ggml_sycl_ornith_gdn_state_io_match {
+    ggml_tensor * gdn;
+    ggml_sycl_gated_delta_net_fused_cache cache;
+    int nodes_to_skip;
+};
+
+static std::atomic<uint64_t> g_ggml_sycl_ornith_gdn_state_io_hits{0};
+
+static bool ggml_sycl_ornith_gdn_state_io_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_GDN_STATE_IO");
+        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr,
+                    "ggml_sycl_ornith_gdn_state_io: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_gdn_state_io_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+// Ornith's one-token Qwen-derived GDN path gathers the sole persistent state
+// row into a temporary before the recurrent kernel. The existing cache fusion
+// already writes the updated state back to that same persistent buffer. Each
+// GDN workgroup owns one state column and loads it fully before writing, so the
+// kernel can safely read and write the persistent buffer in place and elide
+// the GET_ROWS launch as well.
+static bool ggml_sycl_find_ornith_gdn_state_io(
+        const ggml_cgraph * cgraph, int node_idx,
+        ggml_sycl_ornith_gdn_state_io_match & match) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_ornith_gdn_state_io_enabled() ||
+        node_idx < 0 || node_idx >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * get = cgraph->nodes[node_idx];
+    constexpr int64_t state_elems = 128LL * 128 * 32;
+    if (get == nullptr || get->op != GGML_OP_GET_ROWS ||
+        get->src[0] == nullptr || get->src[1] == nullptr ||
+        get->type != GGML_TYPE_F32 || get->src[0]->type != GGML_TYPE_F32 ||
+        get->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(get) ||
+        !ggml_is_contiguous(get->src[0]) || ggml_nrows(get) != 1 ||
+        ggml_nrows(get->src[0]) != 1 || ggml_nelements(get) != state_elems ||
+        ggml_nelements(get->src[0]) != state_elems ||
+        ggml_nelements(get->src[1]) != 1 || get->data == get->src[0]->data) {
+        return false;
+    }
+
+    const auto unwrap = [](const ggml_tensor * tensor) {
+        while (tensor != nullptr && tensor->src[0] != nullptr &&
+               (tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
+                tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE)) {
+            tensor = tensor->src[0];
+        }
+        return tensor;
+    };
+
+    ggml_tensor * gdn = nullptr;
+    int gdn_idx = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 32; ++j) {
+        ggml_tensor * candidate = cgraph->nodes[j];
+        if (candidate != nullptr && candidate->op == GGML_OP_GATED_DELTA_NET &&
+            candidate->src[5] != nullptr && unwrap(candidate->src[5]) == get) {
+            if (gdn != nullptr) {
+                return false;
+            }
+            gdn = candidate;
+            gdn_idx = j;
+        }
+    }
+    if (gdn == nullptr || gdn_idx < 0 || gdn->src[2] == nullptr ||
+        gdn->src[2]->type != GGML_TYPE_F32 || gdn->src[2]->ne[0] != 128 ||
+        gdn->src[2]->ne[1] != 32 || gdn->src[2]->ne[2] != 1 ||
+        gdn->src[2]->ne[3] != 1 || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return false;
+    }
+
+    ggml_sycl_gated_delta_net_fused_cache cache{};
+    const int nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, gdn_idx, cache);
+    if (nodes_to_skip <= 0 || cache.data != get->src[0]->data || cache.slot_stride != 0) {
+        return false;
+    }
+
+    const uintptr_t state_begin = reinterpret_cast<uintptr_t>(cache.data);
+    const uintptr_t state_end = state_begin + (size_t) state_elems * sizeof(float);
+    const uintptr_t gdn_begin = reinterpret_cast<uintptr_t>(gdn->data);
+    const uintptr_t gdn_end = gdn_begin + ggml_nbytes(gdn);
+    if (state_begin < gdn_end && gdn_begin < state_end) {
+        return false;
+    }
+
+    // Shape-only aliases are harmless. The sole compute consumer of the
+    // gathered temporary must be the matched GDN state input.
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * consumer = cgraph->nodes[j];
+        if (consumer == nullptr) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = consumer->src[s];
+            if (src == nullptr || unwrap(src) != get) {
+                continue;
+            }
+            const bool shape_only = consumer->op == GGML_OP_RESHAPE ||
+                                    consumer->op == GGML_OP_VIEW ||
+                                    consumer->op == GGML_OP_PERMUTE ||
+                                    consumer->op == GGML_OP_TRANSPOSE;
+            if (!shape_only && !(consumer == gdn && s == 5)) {
+                return false;
+            }
+        }
+    }
+
+    cache.input_data = cache.data;
+    match = { gdn, cache, nodes_to_skip };
+    return true;
+}
+
+static std::atomic<uint64_t> g_ggml_sycl_ornith_concat_state_hits{0};
+static std::atomic<uint64_t> g_ggml_sycl_ornith_concat_state_direct_hits{0};
+static std::atomic<uint64_t> g_ggml_sycl_ornith_qk_norm_rope_hits{0};
+
+static bool ggml_sycl_ornith_qk_norm_rope_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_QK_NORM_ROPE");
+        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr,
+                    "ggml_sycl_ornith_qk_norm_rope: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_qk_norm_rope_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_ornith_concat_state_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_CONCAT_STATE");
+        const bool on = value != nullptr && std::atoi(value) != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr, "ggml_sycl_ornith_concat_state: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_concat_state_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_ornith_concat_state_direct_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_CONCAT_STATE_DIRECT");
+        const bool on = value != nullptr && std::atoi(value) != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr, "ggml_sycl_ornith_concat_state_direct: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_concat_state_direct_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static const ggml_tensor * ggml_sycl_unwrap_shape_view(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->src[0] != nullptr &&
+           (tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
+            tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE)) {
+        tensor = tensor->src[0];
+    }
+    return tensor;
+}
+
+struct ggml_sycl_ornith_gdn_rms_gate_match {
+    ggml_tensor * rms_norm;
+    ggml_tensor * weight_mul;
+    ggml_tensor * silu;
+    ggml_tensor * gate_mul;
+    int           weight_mul_idx;
+};
+
+static std::atomic<uint64_t> g_ggml_sycl_ornith_gdn_rms_gate_hits{0};
+
+static bool ggml_sycl_ornith_gdn_rms_gate_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_FUSED_ORNITH_GDN_RMS_GATE");
+        const bool on = value != nullptr && std::strcmp(value, "0") != 0;
+        if (on) {
+            std::atexit([] {
+                std::fprintf(stderr,
+                    "ggml_sycl_ornith_gdn_rms_gate: fused_hits=%" PRIu64 "\n",
+                    g_ggml_sycl_ornith_gdn_rms_gate_hits.load(std::memory_order_relaxed));
+            });
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_find_ornith_gdn_rms_gate(
+        const ggml_cgraph * cgraph, int node_idx,
+        ggml_sycl_ornith_gdn_rms_gate_match & match) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_ornith_gdn_rms_gate_enabled() ||
+        node_idx < 0 || node_idx + 5 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+    ggml_tensor * weight_mul = cgraph->nodes[node_idx + 1];
+    if (rms_norm == nullptr || weight_mul == nullptr ||
+        rms_norm->op != GGML_OP_RMS_NORM || weight_mul->op != GGML_OP_MUL ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1) ||
+        !ggml_node_has_n_uses(cgraph, node_idx + 1, 1) ||
+        (weight_mul->src[0] != rms_norm && weight_mul->src[1] != rms_norm)) {
+        return false;
+    }
+
+    int compute_idxs[3] = { -1, -1, -1 };
+    int found = 0;
+    for (int j = node_idx + 2; j < cgraph->n_nodes && found < 3; ++j) {
+        ggml_tensor * candidate = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(candidate) ||
+            (candidate->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        compute_idxs[found++] = j;
+    }
+    if (found != 3) {
+        return false;
+    }
+
+    ggml_tensor * z_projection = cgraph->nodes[compute_idxs[0]];
+    ggml_tensor * silu = cgraph->nodes[compute_idxs[1]];
+    ggml_tensor * gate_mul = cgraph->nodes[compute_idxs[2]];
+    if (z_projection->op != GGML_OP_MUL_MAT || silu->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || gate_mul->op != GGML_OP_MUL ||
+        !ggml_node_has_n_uses(cgraph, compute_idxs[1], 1) ||
+        (gate_mul->src[0] != weight_mul && gate_mul->src[1] != weight_mul) ||
+        (gate_mul->src[0] != silu && gate_mul->src[1] != silu) ||
+        ggml_sycl_unwrap_shape_view(silu->src[0]) != z_projection) {
+        return false;
+    }
+
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * weight = weight_mul->src[0] == rms_norm
+        ? weight_mul->src[1] : weight_mul->src[0];
+    int layer = -1;
+    if (x == nullptr || weight == nullptr ||
+        std::sscanf(weight->name, "blk.%d.ssm_norm.weight", &layer) != 1 ||
+        layer < 0 || layer >= 40 ||
+        x->type != GGML_TYPE_F32 || x->ne[0] != 128 || x->ne[1] != 32 ||
+        x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(x) ||
+        weight->type != GGML_TYPE_F32 || ggml_nelements(weight) != 128 ||
+        !ggml_is_contiguous(weight) ||
+        z_projection->type != GGML_TYPE_F32 || ggml_nelements(z_projection) != 4096 ||
+        gate_mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(gate_mul, x) ||
+        !ggml_is_contiguous(gate_mul)) {
+        return false;
+    }
+
+    char x_name[64];
+    char z_name[64];
+    std::snprintf(x_name, sizeof(x_name), "attn_output-%d", layer);
+    std::snprintf(z_name, sizeof(z_name), "z-%d", layer);
+    if (std::strcmp(x->name, x_name) != 0 || std::strcmp(z_projection->name, z_name) != 0) {
+        return false;
+    }
+
+    match = { rms_norm, weight_mul, silu, gate_mul, node_idx + 1 };
+    return true;
+}
+
+static int ggml_sycl_find_ornith_concat_state(const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_ornith_concat_state_enabled() ||
+        node_idx < 0 || node_idx >= cgraph->n_nodes) {
+        return -1;
+    }
+
+    ggml_tensor * concat = cgraph->nodes[node_idx];
+    if (concat == nullptr || concat->op != GGML_OP_CONCAT ||
+        std::strstr(concat->name, "conv_input-") == nullptr ||
+        concat->src[0] == nullptr || concat->src[1] == nullptr ||
+        concat->type != GGML_TYPE_F32 || concat->src[0]->type != GGML_TYPE_F32 ||
+        concat->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(concat) ||
+        ((const int32_t *) concat->op_params)[0] != 0 ||
+        concat->src[0]->ne[0] != 3 || concat->src[1]->ne[0] != 1 || concat->ne[0] != 4 ||
+        concat->ne[1] != 8192 || concat->src[0]->ne[1] != 8192 || concat->src[1]->ne[1] != 8192 ||
+        concat->ne[2] != 1 || concat->ne[3] != 1) {
+        return -1;
+    }
+
+    ggml_tensor * state_view = nullptr;
+    ggml_tensor * conv = nullptr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * consumer = cgraph->nodes[j];
+        if (consumer == nullptr) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (consumer->src[s] != concat) {
+                continue;
+            }
+            if (s == 0 && consumer->op == GGML_OP_VIEW && state_view == nullptr &&
+                std::strstr(consumer->name, "conv_state_last-") != nullptr) {
+                state_view = consumer;
+            } else if (s == 0 && consumer->op == GGML_OP_SSM_CONV && conv == nullptr &&
+                       std::strstr(consumer->name, "conv_output_raw-") != nullptr) {
+                conv = consumer;
+            } else {
+                return -1;
+            }
+        }
+    }
+    if (state_view == nullptr || conv == nullptr) {
+        return -1;
+    }
+
+    int cpy_idx = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * candidate = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(candidate) || (candidate->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (candidate->op == GGML_OP_CPY && candidate->src[0] == state_view &&
+            std::strstr(candidate->name, "conv_state_update-") != nullptr) {
+            cpy_idx = j;
+        }
+        break;
+    }
+    if (cpy_idx < 0) {
+        return -1;
+    }
+
+    ggml_tensor * cpy = cgraph->nodes[cpy_idx];
+    ggml_tensor * state_dst = cpy->src[1];
+    if (state_dst == nullptr || state_view->type != GGML_TYPE_F32 || state_dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(state_dst) || ggml_nelements(state_view) != ggml_nelements(state_dst) ||
+        state_view->ne[0] != 3 || state_view->ne[1] != 8192 ||
+        state_view->data != (char *) concat->data + concat->nb[0] ||
+        state_view->nb[0] != concat->nb[0] || state_view->nb[1] != concat->nb[1] ||
+        state_view->nb[2] != concat->nb[2] || state_view->nb[3] != concat->nb[3] ||
+        conv->src[0] != concat || conv->src[1] == nullptr || conv->src[1]->type != GGML_TYPE_F32 ||
+        conv->src[1]->ne[0] != 4 || conv->src[1]->ne[1] != 8192) {
+        return -1;
+    }
+
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a0 = (uintptr_t) a->data;
+        const uintptr_t b0 = (uintptr_t) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlaps(state_dst, concat) || overlaps(state_dst, concat->src[0]) || overlaps(state_dst, concat->src[1])) {
+        return -1;
+    }
+
+    return cpy_idx;
+}
+
+struct ggml_sycl_ornith_concat_state_direct_match {
+    ggml_tensor * get_rows = nullptr;
+    ggml_tensor * concat   = nullptr;
+    ggml_tensor * cpy      = nullptr;
+    int concat_idx = -1;
+    int cpy_idx    = -1;
+};
+
+static bool ggml_sycl_find_ornith_concat_state_direct(
+        const ggml_cgraph * cgraph, int node_idx,
+        ggml_sycl_ornith_concat_state_direct_match & match) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_ornith_concat_state_enabled() ||
+        !ggml_sycl_ornith_concat_state_direct_enabled() ||
+        node_idx < 0 || node_idx >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * get_rows = cgraph->nodes[node_idx];
+    if (get_rows == nullptr || get_rows->op != GGML_OP_GET_ROWS ||
+        std::strstr(get_rows->name, "conv_states-") == nullptr ||
+        get_rows->src[0] == nullptr || get_rows->src[1] == nullptr ||
+        get_rows->type != GGML_TYPE_F32 || get_rows->src[0]->type != GGML_TYPE_F32 ||
+        get_rows->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(get_rows) ||
+        !ggml_is_contiguous(get_rows->src[0]) || ggml_nrows(get_rows) != 1 ||
+        ggml_nrows(get_rows->src[0]) != 1 || ggml_nelements(get_rows) != 3 * 8192 ||
+        ggml_nelements(get_rows->src[0]) != ggml_nelements(get_rows) ||
+        ggml_nelements(get_rows->src[1]) != 1 || (get_rows->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+
+    ggml_tensor * concat = nullptr;
+    int concat_idx = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * consumer = cgraph->nodes[j];
+        if (consumer == nullptr) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (consumer->src[s] == nullptr ||
+                ggml_sycl_unwrap_shape_view(consumer->src[s]) != get_rows) {
+                continue;
+            }
+            const bool shape_only = consumer->op == GGML_OP_RESHAPE || consumer->op == GGML_OP_VIEW ||
+                                    consumer->op == GGML_OP_PERMUTE || consumer->op == GGML_OP_TRANSPOSE;
+            if (shape_only) {
+                continue;
+            }
+            if (s == 0 && consumer->op == GGML_OP_CONCAT && concat == nullptr &&
+                std::strstr(consumer->name, "conv_input-") != nullptr) {
+                concat = consumer;
+                concat_idx = j;
+            } else {
+                return false;
+            }
+        }
+    }
+    if (concat == nullptr || concat_idx < 0 || concat->src[0] == nullptr ||
+        ggml_sycl_unwrap_shape_view(concat->src[0]) != get_rows ||
+        concat->src[0]->data != get_rows->data) {
+        return false;
+    }
+
+    const int cpy_idx = ggml_sycl_find_ornith_concat_state(cgraph, concat_idx);
+    if (cpy_idx < 0) {
+        return false;
+    }
+    ggml_tensor * cpy = cgraph->nodes[cpy_idx];
+    if (cpy == nullptr || cpy->src[1] == nullptr ||
+        cpy->src[1]->data != get_rows->src[0]->data ||
+        ggml_nelements(cpy->src[1]) != ggml_nelements(get_rows->src[0])) {
+        return false;
+    }
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a0 = (uintptr_t) a->data;
+        const uintptr_t b0 = (uintptr_t) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlaps(get_rows, concat) || overlaps(get_rows, concat->src[1])) {
+        return false;
+    }
+
+    match.get_rows = get_rows;
+    match.concat = concat;
+    match.cpy = cpy;
+    match.concat_idx = concat_idx;
+    match.cpy_idx = cpy_idx;
+    return true;
+}
+
+struct ggml_sycl_ornith_qk_norm_rope_match {
+    ggml_tensor * q_rms;
+    ggml_tensor * q_mul;
+    ggml_tensor * q_rope;
+    ggml_tensor * k_rms;
+    ggml_tensor * k_mul;
+    ggml_tensor * k_rope;
+    ggml_tensor * k_set_rows;
+    int           k_nodes_consumed;
+};
+
+static int ggml_sycl_tensor_use_count(const ggml_cgraph * cgraph, const ggml_tensor * tensor) {
+    int uses = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            uses += node->src[s] == tensor;
+        }
+    }
+    return uses;
+}
+
+static bool ggml_sycl_tensor_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t a0 = (uintptr_t) a->data;
+    const uintptr_t b0 = (uintptr_t) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// Match only Ornith 1.5's one-token Qwen3.5 full-attention closure. Q is
+// deferred until K normalization, then one kernel preserves the stock SIMD16
+// RMS reduction, FP32 RMS+weight materialization, and IMRoPE arithmetic. K is
+// written directly to the F16 cache; all elided intermediates must have one
+// exact consumer and no exposed output flag.
+static bool ggml_sycl_find_ornith_qk_norm_rope(
+        const ggml_cgraph * cgraph, int i,
+        ggml_sycl_ornith_qk_norm_rope_match & match) {
+    if (!g_ggml_sycl_enable_fusion || !ggml_sycl_ornith_qk_norm_rope_enabled() ||
+        cgraph == nullptr || i < 0 || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * q_rms = cgraph->nodes[i];
+    ggml_tensor * q_mul = cgraph->nodes[i + 1];
+    ggml_tensor * q_rope = cgraph->nodes[i + 2];
+    if (q_rms == nullptr || q_mul == nullptr || q_rope == nullptr ||
+        q_rms->op != GGML_OP_RMS_NORM || q_mul->op != GGML_OP_MUL ||
+        q_rope->op != GGML_OP_ROPE || q_rope->src[0] != q_mul ||
+        !ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) ||
+        !ggml_node_has_n_uses(cgraph, i, 1) || !ggml_node_has_n_uses(cgraph, i + 1, 1) ||
+        ggml_sycl_tensor_use_count(cgraph, q_rope) != 1 ||
+        (q_rms->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (q_mul->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (q_rope->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        std::strstr(q_rope->name, "Qcur-") == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * q_src = q_rms->src[0];
+    const ggml_tensor * q_weight = q_mul->src[0] == q_rms ? q_mul->src[1] : q_mul->src[0];
+    int layer = -1;
+    if (q_src == nullptr || q_weight == nullptr ||
+        std::sscanf(q_weight->name, "blk.%d.attn_q_norm.weight", &layer) != 1 ||
+        layer < 0 || layer >= 40 || q_src->type != GGML_TYPE_F32 ||
+        q_src->ne[0] != 256 || q_src->ne[1] != 16 || q_src->ne[2] != 1 || q_src->ne[3] != 1 ||
+        q_src->nb[0] != sizeof(float) || q_weight->type != GGML_TYPE_F32 ||
+        q_weight->ne[0] != 256 || ggml_nelements(q_weight) != 256 ||
+        q_weight->nb[0] != sizeof(float) || q_rope->type != GGML_TYPE_F32 ||
+        q_rope->ne[0] != 256 || q_rope->ne[1] != 16 || q_rope->ne[2] != 1 || q_rope->ne[3] != 1 ||
+        q_rope->data != q_mul->data || q_rope->src[1] == nullptr ||
+        q_rope->src[1]->type != GGML_TYPE_I32 || q_rope->src[2] != nullptr ||
+        q_rope->src[1]->ne[0] != 4 || ggml_nelements(q_rope->src[1]) != 4) {
+        return false;
+    }
+
+    const int32_t * q_ip = (const int32_t *) q_rope->op_params;
+    float q_fp[6];
+    memcpy(q_fp, q_ip + 5, sizeof(q_fp));
+    if (q_ip[1] != 64 || q_ip[2] != GGML_ROPE_TYPE_IMROPE || q_ip[4] != 262144 ||
+        q_fp[0] != 10000000.0f || q_fp[1] != 1.0f || q_fp[2] != 0.0f || q_fp[3] != 1.0f ||
+        q_fp[4] != 32.0f || q_fp[5] != 1.0f ||
+        q_ip[11] != 11 || q_ip[12] != 11 || q_ip[13] != 10 || q_ip[14] != 0) {
+        return false;
+    }
+
+    ggml_tensor * q_view = nullptr;
+    ggml_tensor * q_permute = nullptr;
+    ggml_tensor * fattn = nullptr;
+    for (int j = i + 3; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * candidate = cgraph->nodes[j];
+        if (candidate == nullptr || candidate->op != GGML_OP_FLASH_ATTN_EXT ||
+            candidate->src[0] == nullptr || candidate->src[0]->op != GGML_OP_PERMUTE ||
+            candidate->src[0]->src[0] == nullptr || candidate->src[0]->src[0]->op != GGML_OP_VIEW ||
+            candidate->src[0]->src[0]->src[0] != q_rope) {
+            continue;
+        }
+        if (fattn != nullptr) {
+            return false;
+        }
+        fattn = candidate;
+        q_permute = candidate->src[0];
+        q_view = q_permute->src[0];
+    }
+    if (fattn == nullptr || q_view == nullptr || q_permute == nullptr ||
+        ggml_sycl_tensor_use_count(cgraph, q_view) != 1 ||
+        ggml_sycl_tensor_use_count(cgraph, q_permute) != 1 ||
+        q_permute->type != GGML_TYPE_F32 || q_view->type != GGML_TYPE_F32 ||
+        q_permute->ne[0] != 256 || q_permute->ne[1] != 1 ||
+        q_permute->ne[2] != 16 || q_permute->ne[3] != 1 ||
+        q_view->ne[0] != 256 || q_view->ne[1] != 16 || q_view->ne[2] != 1 || q_view->ne[3] != 1 ||
+        q_permute->data != q_rope->data || q_view->data != q_rope->data ||
+        (q_view->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (q_permute->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+
+    ggml_sycl_ornith_qk_norm_rope_match found{};
+    int matches = 0;
+    for (int k_i = i + 3; k_i + 2 < cgraph->n_nodes && cgraph->nodes[k_i] != fattn; ++k_i) {
+        ggml_tensor * k_rms = cgraph->nodes[k_i];
+        ggml_tensor * k_mul = cgraph->nodes[k_i + 1];
+        ggml_tensor * k_rope = cgraph->nodes[k_i + 2];
+        if (k_rms == nullptr || k_mul == nullptr || k_rope == nullptr ||
+            k_rms->op != GGML_OP_RMS_NORM || k_mul->op != GGML_OP_MUL ||
+            k_rope->op != GGML_OP_ROPE || k_rope->src[0] != k_mul ||
+            k_rope->src[1] != q_rope->src[1] || k_rope->src[2] != nullptr ||
+            std::memcmp(k_rope->op_params, q_rope->op_params, GGML_MAX_OP_PARAMS) != 0 ||
+            std::strstr(k_rope->name, "Kcur-") == nullptr) {
+            continue;
+        }
+
+        const ggml_tensor * k_src = k_rms->src[0];
+        const ggml_tensor * k_weight = k_mul->src[0] == k_rms ? k_mul->src[1] : k_mul->src[0];
+        int k_layer = -1;
+        if (k_src == nullptr || k_weight == nullptr ||
+            std::sscanf(k_weight->name, "blk.%d.attn_k_norm.weight", &k_layer) != 1 ||
+            k_layer != layer || k_src->type != GGML_TYPE_F32 ||
+            k_src->ne[0] != 256 || k_src->ne[1] != 2 || k_src->ne[2] != 1 || k_src->ne[3] != 1 ||
+            k_src->nb[0] != sizeof(float) || k_weight->type != GGML_TYPE_F32 ||
+            k_weight->ne[0] != 256 || ggml_nelements(k_weight) != 256 ||
+            k_weight->nb[0] != sizeof(float) || k_rope->type != GGML_TYPE_F32 ||
+            k_rope->ne[0] != 256 || k_rope->ne[1] != 2 || k_rope->ne[2] != 1 || k_rope->ne[3] != 1 ||
+            !ggml_sycl_can_fuse(cgraph, k_i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) ||
+            !ggml_node_has_n_uses(cgraph, k_i, 1) || !ggml_node_has_n_uses(cgraph, k_i + 1, 1) ||
+            ggml_sycl_tensor_use_count(cgraph, k_rope) != 1 ||
+            (k_rms->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+            (k_mul->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+            (k_rope->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            continue;
+        }
+
+        ggml_tensor * view = nullptr;
+        ggml_tensor * set_rows = nullptr;
+        int nodes_consumed = 0;
+        if (k_i + 4 < cgraph->n_nodes && cgraph->nodes[k_i + 3]->op == GGML_OP_VIEW &&
+            cgraph->nodes[k_i + 4]->op == GGML_OP_SET_ROWS) {
+            view = cgraph->nodes[k_i + 3];
+            set_rows = cgraph->nodes[k_i + 4];
+            nodes_consumed = 2;
+        } else if (k_i + 3 < cgraph->n_nodes && cgraph->nodes[k_i + 3]->op == GGML_OP_SET_ROWS &&
+            cgraph->nodes[k_i + 3]->src[0] != nullptr &&
+            cgraph->nodes[k_i + 3]->src[0]->op == GGML_OP_VIEW) {
+            view = cgraph->nodes[k_i + 3]->src[0];
+            set_rows = cgraph->nodes[k_i + 3];
+            nodes_consumed = 1;
+        }
+        if (view == nullptr || set_rows == nullptr || view->src[0] != k_rope ||
+            set_rows->src[0] != view || ggml_sycl_tensor_use_count(cgraph, view) != 1 ||
+            (view->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+            set_rows->type != GGML_TYPE_F16 || set_rows->src[1] == nullptr ||
+            set_rows->src[1]->type != GGML_TYPE_I64 || !ggml_is_contiguous(view) ||
+            view->ne[0] != 512 || ggml_nelements(view) != 512 ||
+            ggml_sycl_tensor_ranges_overlap(set_rows, q_src) ||
+            ggml_sycl_tensor_ranges_overlap(set_rows, k_src) ||
+            ggml_sycl_tensor_ranges_overlap(set_rows, q_weight) ||
+            ggml_sycl_tensor_ranges_overlap(set_rows, k_weight) ||
+            ggml_sycl_tensor_ranges_overlap(set_rows, q_rope)) {
+            continue;
+        }
+
+        float q_eps = 0.0f;
+        float k_eps = 0.0f;
+        memcpy(&q_eps, q_rms->op_params, sizeof(float));
+        memcpy(&k_eps, k_rms->op_params, sizeof(float));
+        if (q_eps < 0.0f || q_eps != k_eps) {
+            continue;
+        }
+
+        found = { q_rms, q_mul, q_rope, k_rms, k_mul, k_rope, set_rows, nodes_consumed };
+        ++matches;
+    }
+
+    if (matches != 1) {
+        return false;
+    }
+    match = found;
+    return true;
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    std::vector<ggml_sycl_ornith_concat_state_direct_match> pending_ornith_concat_state_direct;
+    pending_ornith_concat_state_direct.reserve(64);
+    std::vector<ggml_sycl_ornith_gdn_rms_gate_match> pending_ornith_gdn_rms_gate;
+    pending_ornith_gdn_rms_gate.reserve(40);
+    std::vector<ggml_sycl_ornith_gdn_state_io_match> pending_ornith_gdn_state_io;
+    pending_ornith_gdn_state_io.reserve(40);
+    std::vector<ggml_sycl_ornith_qk_norm_rope_match> pending_ornith_qk_norm_rope;
+    pending_ornith_qk_norm_rope.reserve(10);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6418,6 +7486,84 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        const auto qk_pending = std::find_if(
+            pending_ornith_qk_norm_rope.begin(), pending_ornith_qk_norm_rope.end(),
+            [node](const ggml_sycl_ornith_qk_norm_rope_match & candidate) {
+                return candidate.k_rms == node;
+            });
+        if (qk_pending != pending_ornith_qk_norm_rope.end()) {
+            const int nodes_consumed = qk_pending->k_nodes_consumed;
+            ggml_sycl_ornith_rms_mul_rope_qk_fused(
+                *sycl_ctx,
+                qk_pending->q_rms, qk_pending->q_mul, qk_pending->q_rope,
+                qk_pending->k_rms, qk_pending->k_mul, qk_pending->k_rope,
+                qk_pending->k_set_rows);
+            g_ggml_sycl_ornith_qk_norm_rope_hits.fetch_add(1, std::memory_order_relaxed);
+            pending_ornith_qk_norm_rope.erase(qk_pending);
+            i += 2 + nodes_consumed;
+            continue;
+        }
+
+        if (node->op == GGML_OP_RMS_NORM) {
+            ggml_sycl_ornith_qk_norm_rope_match match;
+            if (ggml_sycl_find_ornith_qk_norm_rope(cgraph, i, match)) {
+                pending_ornith_qk_norm_rope.push_back(match);
+                i += 2;
+                continue;
+            }
+        }
+
+        if (node->op == GGML_OP_GET_ROWS) {
+            ggml_sycl_ornith_gdn_state_io_match gdn_state_io;
+            if (ggml_sycl_find_ornith_gdn_state_io(cgraph, i, gdn_state_io)) {
+                pending_ornith_gdn_state_io.push_back(gdn_state_io);
+                continue;
+            }
+            ggml_sycl_ornith_concat_state_direct_match match;
+            if (ggml_sycl_find_ornith_concat_state_direct(cgraph, i, match)) {
+                pending_ornith_concat_state_direct.push_back(match);
+                continue;
+            }
+        }
+
+        if (node->op == GGML_OP_CONCAT) {
+            auto direct = std::find_if(
+                pending_ornith_concat_state_direct.begin(), pending_ornith_concat_state_direct.end(),
+                [node](const ggml_sycl_ornith_concat_state_direct_match & candidate) {
+                    return candidate.concat == node;
+                });
+            if (direct != pending_ornith_concat_state_direct.end()) {
+                ggml_sycl_concat_state_update_direct(
+                    *sycl_ctx, direct->get_rows, direct->concat, direct->cpy);
+                g_ggml_sycl_ornith_concat_state_direct_hits.fetch_add(1, std::memory_order_relaxed);
+                i = direct->cpy_idx;
+                pending_ornith_concat_state_direct.erase(direct);
+                continue;
+            }
+            const int cpy_idx = ggml_sycl_find_ornith_concat_state(cgraph, i);
+            if (cpy_idx >= 0) {
+                ggml_sycl_concat_state_update(*sycl_ctx, node, cgraph->nodes[cpy_idx]);
+                g_ggml_sycl_ornith_concat_state_hits.fetch_add(1, std::memory_order_relaxed);
+                i = cpy_idx;
+                continue;
+            }
+        }
+
+        if (node->op == GGML_OP_GATED_DELTA_NET) {
+            auto state_io = std::find_if(
+                pending_ornith_gdn_state_io.begin(), pending_ornith_gdn_state_io.end(),
+                [node](const ggml_sycl_ornith_gdn_state_io_match & candidate) {
+                    return candidate.gdn == node;
+                });
+            if (state_io != pending_ornith_gdn_state_io.end()) {
+                ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, state_io->cache);
+                g_ggml_sycl_ornith_gdn_state_io_hits.fetch_add(1, std::memory_order_relaxed);
+                i += state_io->nodes_to_skip;
+                pending_ornith_gdn_state_io.erase(state_io);
+                continue;
+            }
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
@@ -6440,6 +7586,62 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_ADD) {
+            if (ggml_sycl_can_fuse_ornith_moe_shared_residual_rms(cgraph, i)) {
+                ggml_sycl_op_moe_shared_residual_rms_norm_fused(
+                    *sycl_ctx, node, cgraph->nodes[i + 1],
+                    cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+                g_ggml_sycl_ornith_moe_shared_residual_rms_hits.fetch_add(
+                    1, std::memory_order_relaxed);
+                i += 3;
+                continue;
+            }
+            if (ggml_sycl_can_fuse_residual_rms_norm(cgraph, i)) {
+                ggml_sycl_op_residual_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                g_ggml_sycl_residual_rms_norm_hits.fetch_add(1, std::memory_order_relaxed);
+                i += 2;
+                continue;
+            }
+            ggml_sycl_moe_add_reduce_match moe_add_reduce;
+            if (ggml_sycl_find_moe_add_reduce(cgraph, i, moe_add_reduce)) {
+                ggml_sycl_moe_add_reduce(*sycl_ctx, moe_add_reduce);
+                i += moe_add_reduce.nodes_to_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_RMS_NORM) {
+            ggml_sycl_ornith_gdn_rms_gate_match match;
+            if (ggml_sycl_find_ornith_gdn_rms_gate(cgraph, i, match)) {
+                pending_ornith_gdn_rms_gate.push_back(match);
+                i = match.weight_mul_idx;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_UNARY) {
+            if (ggml_sycl_can_fuse_ornith_moe_gate_residual_rms(cgraph, i)) {
+                ggml_sycl_op_moe_shared_gate_residual_rms_norm_fused(
+                    *sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                    cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+                g_ggml_sycl_ornith_moe_gate_residual_rms_hits.fetch_add(
+                    1, std::memory_order_relaxed);
+                i += 5;
+                continue;
+            }
+            auto pending = std::find_if(
+                pending_ornith_gdn_rms_gate.begin(), pending_ornith_gdn_rms_gate.end(),
+                [node](const ggml_sycl_ornith_gdn_rms_gate_match & candidate) {
+                    return candidate.silu == node;
+                });
+            if (pending != pending_ornith_gdn_rms_gate.end()) {
+                ggml_sycl_op_ornith_gdn_rms_silu_gate_fused(
+                    *sycl_ctx, pending->rms_norm, pending->weight_mul,
+                    pending->silu, pending->gate_mul);
+                g_ggml_sycl_ornith_gdn_rms_gate_hits.fetch_add(1, std::memory_order_relaxed);
+                i++;
+                pending_ornith_gdn_rms_gate.erase(pending);
                 continue;
             }
         }
@@ -6512,6 +7714,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+            i += 2;
+            continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID &&
+            ggml_sycl_ornith_moe_gate_up_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
             continue;
         }
