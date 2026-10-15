@@ -1,14 +1,15 @@
 # sycl-fa-xe2-occupancy: size the SYCL flash-attention KV split from Xe2 occupancy
 
 Branch [`sycl-fa-xe2-occupancy`](https://github.com/riceharvest/llama.cpp/tree/sycl-fa-xe2-occupancy), on llama.cpp master
-`a0e6dc738`, head `7a1e2953a`. **Compile-checked only; nothing measured yet.**
+`a0e6dc738`, head `3866c52c1`. Measured once on the B70 (testq 010); 2 multi-token test cases open (see Correctness).
 
 | commit | what |
 |---|---|
 | `01b80b29a` | KV split sized from Xe2 occupancy (`fattn-common.hpp`) |
 | `f116c0ffa` | test knobs (not for upstream) |
 | `5cd25b667` | tile kernel: GQA ratio need not be a multiple of the tile width (padding columns); FLASH_ATTN_EXT cases with GQA 3 and 6 |
-| `7a1e2953a` | dispatch that uses the padding, behind `GGML_SYCL_FA_TILE_GQA_PAD=1` (default off until measured) |
+| `7a1e2953a` | dispatch that uses the padding, behind `GGML_SYCL_FA_TILE_GQA_PAD=1` |
+| `3866c52c1` | padding on by default for GQA ratios that are not a multiple of 4 (`GGML_SYCL_FA_TILE_GQA_PAD=0` turns it off); GQA 3/6 tests also at a 64-token batch |
 
 ## What changes
 
@@ -39,6 +40,28 @@ Q-head tile so padding works (padding columns load Q = 0, skip sinks and write n
 
 Expected split on the B70 at 32K (from the launch arithmetic): 35B-A3B 32 → 128 blocks, 27B 16 → 85 blocks.
 
+## Measured (testq 010, 2026-10-15)
+
+llama-bench -fa 1 -p 0 -n 64, unsloth Qwen3.6-35B-A3B UD-Q4_K_M and Qwen3.8-27B UD-Q4_K_XL, one rep per 32K arm, old arms
+first (heat would favour the old split):
+
+| model, context | old split | new split | new split + GQA padding |
+|---|---|---|---|
+| 35B-A3B, 0 | 84.83 | 84.94 | (GQA 8: no padding) |
+| 35B-A3B, 32K | 64.14 | **75.16 (+17.2%)** | |
+| 27B, 32K | 14.62 | **16.01 (+9.5%)** | **18.63 (+27% vs old)** |
+
+- 27B with `ncols2 = 1` (each K/V head read 6 times): 11.86, so the re-reads cost real time.
+- Forcing a split of 512 on the 35B: 64.10, no better than the old split: more blocks alone do not help.
+- All arms ran ~13% below other sessions' numbers (d=0 included), so compare within the table only.
+
+## Correctness
+
+`test-backend-ops -o FLASH_ATTN_EXT -p hsk=256`: 163/165 at the default and at a forced split. Failing (ERR ~1):
+`nr23=[16,1],kv=1025,nb=64,q8_0,permute=[0,2,1,3]` and `nr23=[12,2],kv=8192,nb=67,f16,n_kv_max=512`. Both are
+multi-token; every decode case passes; GQA 3/6 with padding 37/37. Whether master fails the same two is being checked;
+until then treat the new split as decode-tested only.
+
 ## Test knobs (`f116c0ffa`)
 
 | variable | effect |
@@ -47,7 +70,7 @@ Expected split on the B70 at 32K (from the launch arithmetic): 35B-A3B 32 → 12
 | `GGML_SYCL_FA_PARALLEL_BLOCKS=N` | force the split (clamped to the number of KV tiles) |
 | `GGML_SYCL_FA_LOG_SPLIT=1` | log the first 64 split decisions |
 | `GGML_SYCL_FA_TILE_GQA_OPT=0` | tile kernel with one Q head per KV read (ncols2=1) |
-| `GGML_SYCL_FA_TILE_GQA_PAD=1` | pad GQA 5-7 to ncols2=8 and GQA 3 to 4 |
+| `GGML_SYCL_FA_TILE_GQA_PAD=0/1` | GQA padding off / on (on by default since `3866c52c1` for GQA % 4 != 0) |
 
 ## Reproduce
 
