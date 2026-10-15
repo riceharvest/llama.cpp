@@ -9,6 +9,13 @@ A port of the public-domain "twelve-feature" SYCL patch from
 35B-A3B Q4_K_M). Ornith 1.5 uses the `qwen35moe` architecture with the same shapes as Qwen3.6-35B-A3B, so the matchers apply
 to the stock model too.
 
+**Clean version:** [`sycl-qwen35moe-fusions-v2`](https://github.com/riceharvest/llama.cpp/tree/sycl-qwen35moe-fusions-v2)
+(`7581d6d99`, two commits: the fusions, then test-backend-ops cases). Same code with `ornith` renamed to `qwen35moe`
+(flags `GGML_SYCL_FUSED_QWEN35MOE_*`, e.g. `GGML_SYCL_FUSED_ORNITH_MOE_GATE_UP` → `GGML_SYCL_FUSED_QWEN35MOE_MOE_GATE_UP`,
+`GGML_SYCL_FUSED_MOE_ADD_REDUCE` → `GGML_SYCL_FUSED_QWEN35MOE_MOE_ADD_REDUCE`) and the fault-injection `*_POISON` knobs
+removed. The test cases (`test-backend-ops -o QWEN35MOE_...`) rebuild each fusion's one-token sub-graph with the names
+and shapes its matcher expects; run them with the flags set. The table below uses the first branch's names.
+
 Each fusion has its own environment flag and is off by default. Its matcher checks exact tensor names, shapes, strides and
 consumers, and falls back to the normal path otherwise. Each prints `fused_hits=N` at exit when enabled:
 
