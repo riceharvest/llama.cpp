@@ -702,6 +702,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t use_cache;         // fused GDN + CPY: write the state snapshots to binding 7 (the cache view)
+    uint32_t cache_slot_stride; // elements between rollback slots in the cache view
 };
 
 struct vk_op_ssm_scan_push_constants {
