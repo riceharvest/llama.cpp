@@ -90,6 +90,13 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+FLOAT_TYPE mat_vec_glu(const FLOAT_TYPE acc, const FLOAT_TYPE other) {
+    const bool is_gate = (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0;
+    const float g = float(is_gate ? acc : other);
+    const float u = float(is_gate ? other : acc);
+    return FLOAT_TYPE(g / (1.0f + exp(-g)) * u);
+}
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -121,6 +128,9 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
+                if ((p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
+                    temp[j][n] = mat_vec_glu(temp[j][n], FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]));
+                }
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
         }
@@ -176,6 +186,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
+                if ((p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
+                    temp[j][n] = mat_vec_glu(temp[j][n], FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]));
+                }
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
         }
@@ -221,6 +234,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
+                if ((p.fusion_flags & (MAT_VEC_FUSION_FLAGS_GLU_A | MAT_VEC_FUSION_FLAGS_GLU_B)) != 0) {
+                    tmpsh[j][n][0] = mat_vec_glu(tmpsh[j][n][0], FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]));
+                }
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }
         }

@@ -6930,7 +6930,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     uint32_t fusion_flags = 0;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
+    if (ctx->num_additional_fused_ops > 0 && cgraph->nodes[node_idx + 1]->op == GGML_OP_GLU) {
+        const ggml_tensor * glu = cgraph->nodes[node_idx + 1];
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, glu->src[0] == dst ? glu->src[1] : glu->src[0]);
+        fusion_flags |= glu->src[0] == dst ? MAT_VEC_FUSION_FLAGS_GLU_A : MAT_VEC_FUSION_FLAGS_GLU_B;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -7939,7 +7943,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     uint32_t fusion_flags = 0;
 
-    if (ctx->num_additional_fused_ops > 0) {
+    if (ctx->num_additional_fused_ops > 0 && cgraph->nodes[node_idx + 1]->op == GGML_OP_GLU) {
+        const ggml_tensor * glu = cgraph->nodes[node_idx + 1];
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, glu->src[0] == dst ? glu->src[1] : glu->src[0]);
+        fusion_flags |= glu->src[0] == dst ? MAT_VEC_FUSION_FLAGS_GLU_A : MAT_VEC_FUSION_FLAGS_GLU_B;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
         d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
@@ -13694,6 +13702,37 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         }
     }
 
+    // mat-vec + split SWIGLU: the mat-vec epilogue computes silu(gate) * up, the other operand is read from data_fuse0
+    if (ops.size() == 2 && (ops.begin()[0] == GGML_OP_MUL_MAT || ops.begin()[0] == GGML_OP_MUL_MAT_ID) && ops.begin()[1] == GGML_OP_GLU) {
+        const ggml_tensor *mm  = cgraph->nodes[node_idx];
+        const ggml_tensor *glu = cgraph->nodes[node_idx + 1];
+        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+            return false;
+        }
+        if (glu->src[0] != mm && glu->src[1] != mm) {
+            return false;
+        }
+        const ggml_tensor *other = glu->src[0] == mm ? glu->src[1] : glu->src[0];
+        if (mm->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // the shader indexes the other operand like the output
+        if (!ggml_are_same_shape(mm, other) || !ggml_are_same_shape(mm, glu) ||
+            !ggml_is_contiguous(mm) || !ggml_is_contiguous(other) || !ggml_is_contiguous(glu) ||
+            get_misalign_bytes(ctx, other) != 0 || get_misalign_bytes(ctx, glu) != 0) {
+            return false;
+        }
+        if (mm->op == GGML_OP_MUL_MAT) {
+            // mat-vec only, and the main mat-vec path (not the permuted/non-contiguous f16 ones)
+            if (ggml_nrows(mm) != 1 || !ggml_is_contiguous(mm->src[0])) {
+                return false;
+            }
+        } else if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+            return false;
+        }
+        return true;
+    }
+
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
@@ -14479,6 +14518,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "MUL_MAT_GLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_GLU })) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "MUL_MAT_ID_GLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";

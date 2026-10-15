@@ -4,6 +4,10 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// SWIGLU with the other GLU operand in data_fuse0 (same layout as the output):
+// GLU_A: this result is the gate, out = silu(acc) * fuse0. GLU_B: this result is the up, out = silu(fuse0) * acc.
+#define MAT_VEC_FUSION_FLAGS_GLU_A 0x10
+#define MAT_VEC_FUSION_FLAGS_GLU_B 0x20
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
