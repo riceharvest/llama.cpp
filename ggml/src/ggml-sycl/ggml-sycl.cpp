@@ -3110,7 +3110,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // Fast path for bf16 src0
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn &&
         ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1]) {
+        row_diff == src0->ne[1] && ggml_sycl_dnnl_aligned({ src0_dd_i, dst_dd_i })) {
         using bf16_t = sycl::ext::oneapi::bfloat16;
         ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
         if (src1->type != GGML_TYPE_BF16) {
@@ -3172,7 +3172,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                          : src0_as_f16.get();
 
 #if GGML_SYCL_DNNL
-        if (g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
+        if (g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) &&
+            ggml_sycl_dnnl_aligned({ src0_ptr, src1_ptr, dst_dd_i })) {
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
@@ -3216,7 +3217,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #if GGML_SYCL_DNNL
             const int64_t gemm_flops = (int64_t)row_diff * src1_ncols * ne10;
             const bool use_mkl_direct = gemm_flops < 256 * 256 * 256;
-            if (g_ggml_sycl_enable_dnn && !use_mkl_direct && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
+            if (g_ggml_sycl_enable_dnn && !use_mkl_direct && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) &&
+                ggml_sycl_dnnl_aligned({ src0_ddf_i, src1_ddf1_i, dst_dd_i })) {
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
                                           DnnlGemmWrapper::to_dt<float>(), src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(),
                                           dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);

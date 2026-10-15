@@ -14,6 +14,8 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include <cstddef>
+#include <cstdint>
+#include <initializer_list>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -690,6 +692,17 @@ bool gpu_has_xmx(sycl::device &dev);
 // reference kernels, which are much slower than the SYCL kernels here.
 inline bool ggml_sycl_dnnl_has_optimized_gemm(int device) {
     return ggml_sycl_info().devices[device].opt_feature.onednn_optimized_gemm;
+}
+
+// oneDNN's optimized GPU kernels reject buffers that are not 64-byte aligned (an error at execute, not a fallback).
+// Slices of a larger buffer can be misaligned, e.g. the per-expert rows of MUL_MAT_ID with a small number of rows.
+inline bool ggml_sycl_dnnl_aligned(std::initializer_list<const void *> ptrs) {
+    for (const void * p : ptrs) {
+        if (reinterpret_cast<uintptr_t>(p) % 64 != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 #endif
 
