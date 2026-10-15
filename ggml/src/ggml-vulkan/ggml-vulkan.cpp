@@ -3224,7 +3224,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 
         for (auto& it : device->pipeline_xe_fa_decode_dual_phases) {
-            const uint32_t split_p_chunk = 32;
+            const uint32_t split_p_chunk = getenv("GGML_VK_XE_FA_PCHUNK") ? (uint32_t) atoi(getenv("GGML_VK_XE_FA_PCHUNK")) : 32; // TEST knob
             auto HdQk = it.first;
             auto& pipelines = it.second;
             uint32_t head_dim_qk = std::get<0>(HdQk);
@@ -3240,7 +3240,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             uint32_t split_p_per_warp = 16;
             uint32_t group_sz_ph2 = (split_p_per_iter_ph2 / split_p_per_warp) * xe_native_sub_group_size;
             uint32_t out_per_wg_ph2 = std::min(std::max(16u / aligned_gqa_ratio, 1u), q_len);
-            ggml_vk_create_pipeline(device, pipelines.first, "xe_fa_decode_ph1", fa_decode_ph1_cm1_len, fa_decode_ph1_cm1_data, "main", 5, sizeof(vk_fa_xe_opt_push_constants), { 1, 32, 1 }, { group_sz_ph1, gqa_ratio, head_dim_qk, xe_native_sub_group_size, split_p_chunk, out_per_wg_ph1 }, 1, false, true, xe_native_sub_group_size);
+            ggml_vk_create_pipeline(device, pipelines.first, "xe_fa_decode_ph1", fa_decode_ph1_cm1_len, fa_decode_ph1_cm1_data, "main", 5, sizeof(vk_fa_xe_opt_push_constants), { 1, split_p_chunk, 1 }, { group_sz_ph1, gqa_ratio, head_dim_qk, xe_native_sub_group_size, split_p_chunk, out_per_wg_ph1 }, 1, false, true, xe_native_sub_group_size);
             ggml_vk_create_pipeline(device, pipelines.second, "xe_fa_decode_ph2", fa_decode_ph2_cm1_len, fa_decode_ph2_cm1_data, "main", 5, sizeof(vk_fa_xe_opt_push_constants), { 1, 1, 1 }, { group_sz_ph2, gqa_ratio, head_dim_pv, out_per_wg_ph2, xe_native_sub_group_size, split_p_per_iter_ph2, split_p_chunk, out_dim_per_wg }, 1, false, true, xe_native_sub_group_size);
         }
     }
@@ -5942,10 +5942,29 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     uint32_t split_k = 1;
+    // TEST ONLY: GGML_VK_MM_SPLITK=s forces split_k for k >= 2048 and m <= GGML_VK_MM_TILE_MAX_M
+    if (const char * fs = getenv("GGML_VK_MM_SPLITK")) {
+        const uint32_t max_m = getenv("GGML_VK_MM_TILE_MAX_M") ? (uint32_t) atoi(getenv("GGML_VK_MM_TILE_MAX_M")) : UINT32_MAX;
+        if (k >= 2048 && m <= max_m && n >= pipeline->wg_denoms[1]) {
+            split_k = (uint32_t) std::max(1, atoi(fs));
+            while (split_k > 1 && ROUNDUP_POW2(CEIL_DIV(k, split_k), 256) * (split_k - 1) >= k) split_k--;
+            return split_k;
+        }
+    }
     if (ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
+
+        // Xe2: with only a few large tiles per core (e.g. FFN down projections at n=512), splitting a long k still pays off
+        if (ctx->device->architecture == vk_device_architecture::INTEL_XE2 && k >= 6144 &&
+            m_tiles * n_tiles > ctx->device->shader_core_count * 2 / 3 && m_tiles * n_tiles <= ctx->device->shader_core_count * 6) {
+            split_k = k >= 12288 ? 4 : 2;
+            while (split_k > 1 && ROUNDUP_POW2(CEIL_DIV(k, split_k), 256) * (split_k - 1) >= k) {
+                split_k--;
+            }
+            return split_k;
+        }
 
         if (k >= 2048) {
             if (m_tiles * n_tiles <= ctx->device->shader_core_count / 2) {
@@ -6079,6 +6098,11 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline_map(ggml_backend_vk_context * c
         uint32_t m, uint32_t n, bool aligned, bool mul_mat_id) {
     auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
     uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
+    // TEST ONLY: GGML_VK_MM_TILE=0|1|2 forces the tile config for m <= GGML_VK_MM_TILE_MAX_M (default: all m)
+    if (!mul_mat_id && getenv("GGML_VK_MM_TILE")) {
+        const uint32_t max_m = getenv("GGML_VK_MM_TILE_MAX_M") ? (uint32_t) atoi(getenv("GGML_VK_MM_TILE_MAX_M")) : UINT32_MAX;
+        if (m <= max_m) idx = (uint32_t) atoi(getenv("GGML_VK_MM_TILE"));
+    }
     if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
     return (aligned && configs[idx].aligned) ? configs[idx].aligned : configs[idx].unaligned;
 }
@@ -6088,6 +6112,11 @@ static uint32_t ggml_vk_guess_matmul_pipeline_align_map(ggml_backend_vk_context 
         uint32_t m, uint32_t n, bool mul_mat_id) {
     auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
     uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
+    // TEST ONLY: GGML_VK_MM_TILE=0|1|2 forces the tile config for m <= GGML_VK_MM_TILE_MAX_M (default: all m)
+    if (!mul_mat_id && getenv("GGML_VK_MM_TILE")) {
+        const uint32_t max_m = getenv("GGML_VK_MM_TILE_MAX_M") ? (uint32_t) atoi(getenv("GGML_VK_MM_TILE_MAX_M")) : UINT32_MAX;
+        if (m <= max_m) idx = (uint32_t) atoi(getenv("GGML_VK_MM_TILE"));
+    }
     if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
     return configs[idx].align;
 }
@@ -8371,7 +8400,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_k = CEIL_DIV(KV, split_kv);
         xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !getenv("GGML_VK_DISABLE_XE_FA");
         if (xe_fa_opt) {
-            const uint32_t split_p_size = 32;
+            const uint32_t split_p_size = getenv("GGML_VK_XE_FA_PCHUNK") ? (uint32_t) atoi(getenv("GGML_VK_XE_FA_PCHUNK")) : 32; // TEST knob
             const size_t max_dim = (nek1 + split_p_size - 1) / split_p_size;
             const size_t p_dim = max_dim * split_p_size;
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
