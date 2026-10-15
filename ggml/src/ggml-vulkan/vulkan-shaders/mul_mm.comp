@@ -120,7 +120,12 @@ layout (binding = 0) readonly buffer BUF_Q5_K_P32   { block_q5_K_packed32 data[]
 
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
+#if defined(COOPMAT) && !defined(MUL_MAT_ID)
+// Not writeonly: the FLUSH_K path reads back its own fp32 partial sums from D.
+layout (binding = 2) buffer D {D_TYPE data_d[];};
+#else
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
@@ -190,6 +195,13 @@ const uint SHMEM_STRIDE_PAD = 1;
 const bool APPLY_SLM_A_RESHAPE = false;
 #endif
 #define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
+
+#if defined(COOPMAT) && !defined(MUL_MAT_ID)
+// When non-zero (set by the host for fp16-accumulator pipelines, must be a multiple of BK), the fp16 coopmat
+// accumulators are folded into fp32 partial sums kept in D every FLUSH_K elements of K and then reset, so the
+// fp16 rounding error no longer grows with the full K (and partial sums are not clamped at 65504).
+layout(constant_id = 15) const uint FLUSH_K = 0;
+#endif
 
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
@@ -338,6 +350,13 @@ void main() {
     }
 #endif
 
+#if defined(COOPMAT) && !defined(MUL_MAT_ID)
+    const uint fl_dr = ir * BM + warp_r * WM;
+    const uint fl_dc = ic * BN + warp_c * WN;
+    const uint fl_offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+    const bool fl_aligned = p.stride_d % 4 == 0;
+#endif
+
     for (uint block = start_k; block < end_k; block += BK) {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
@@ -378,6 +397,30 @@ void main() {
             }
         }
 #ifdef MUL_MAT_ID
+        }
+#else
+        if (FLUSH_K != 0 && (block + BK - start_k) % FLUSH_K == 0 && block + BK < end_k) {
+            const bool first_flush = block + BK - start_k == FLUSH_K;
+            [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                    // Only full, 16B-aligned tiles are flushed (same condition as the direct store below);
+                    // edge tiles keep accumulating in ACC_TYPE as before.
+                    if (fl_aligned && fl_dr + (cm_row + 1) * TM <= p.M && fl_dc + (cm_col + 1) * TN <= p.N) {
+                        const uint idx = cm_col * cms_per_row + cm_row;
+                        const uint off = fl_offsets + (fl_dc + cm_col * TN) * p.stride_d + fl_dr + cm_row * TM;
+                        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc32 = coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[idx]);
+                        if (!first_flush) {
+                            coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> prev;
+                            coopMatLoad(prev, data_d, off, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                            acc32 = acc32 + prev;
+                        }
+                        coopMatStore(acc32, data_d, off, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                        sums[idx] = coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+                    }
+                }
+            }
+            // make this subgroup's D stores visible to its own later coopMatLoad of the same tiles
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
         }
 #endif
 #else
@@ -471,6 +514,12 @@ void main() {
             if (is_aligned && is_in_bounds) {
                 // Full coopMat is within bounds and stride_d is aligned with 16B
                 coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_dtype = coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * cms_per_row + cm_row]);
+                // at least one flush happened -> D holds the fp32 partial sum of this tile
+                if (FLUSH_K != 0 && start_k + FLUSH_K < end_k) {
+                    coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> prev;
+                    coopMatLoad(prev, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                    cm_dtype = cm_dtype + prev;
+                }
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
                 // Full coopMat is within bounds, but stride_d is not aligned
