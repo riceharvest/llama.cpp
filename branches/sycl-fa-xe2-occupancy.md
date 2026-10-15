@@ -1,8 +1,14 @@
 # sycl-fa-xe2-occupancy: size the SYCL flash-attention KV split from Xe2 occupancy
 
 Branch [`sycl-fa-xe2-occupancy`](https://github.com/riceharvest/llama.cpp/tree/sycl-fa-xe2-occupancy), on llama.cpp master
-`a0e6dc738`: `01b80b29a` (the change, `fattn-common.hpp` +26/-1) and `f116c0ffa` (environment knobs for testing; not for
-upstream). **Compile-checked only; nothing measured yet.**
+`a0e6dc738`, head `7a1e2953a`. **Compile-checked only; nothing measured yet.**
+
+| commit | what |
+|---|---|
+| `01b80b29a` | KV split sized from Xe2 occupancy (`fattn-common.hpp`) |
+| `f116c0ffa` | test knobs (not for upstream) |
+| `5cd25b667` | tile kernel: GQA ratio need not be a multiple of the tile width (padding columns); FLASH_ATTN_EXT cases with GQA 3 and 6 |
+| `7a1e2953a` | dispatch that uses the padding, behind `GGML_SYCL_FA_TILE_GQA_PAD=1` (default off until measured) |
 
 ## What changes
 
@@ -23,6 +29,14 @@ the large register file, fewer if the launch's dynamic local memory runs out) fo
 split still starts from the old value, so launches that already have many tiles (prefill) mostly keep their split.
 Other GPUs are unchanged.
 
+## GQA padding (5cd25b667, 7a1e2953a)
+
+The tile kernel processes `ncols2` Q heads of one K/V head per block and picks the largest of 8/4/2/1 that divides the GQA
+ratio. Qwen3.8-27B has GQA 6, so it gets `ncols2 = 2` and each K/V head is streamed 3 times per token. CUDA's mma kernel
+pads instead (`gqa_ratio > 4` → 8, since b0311c16d). The branch makes the SYCL tile kernel index blocks by K/V head and
+Q-head tile so padding works (padding columns load Q = 0, skip sinks and write nothing), and with the knob on uses
+`ncols2 = 8` for GQA 5-7 and 4 for GQA 3.
+
 Expected split on the B70 at 32K (from the launch arithmetic): 35B-A3B 32 → 128 blocks, 27B 16 → 85 blocks.
 
 ## Test knobs (`f116c0ffa`)
@@ -33,6 +47,7 @@ Expected split on the B70 at 32K (from the launch arithmetic): 35B-A3B 32 → 12
 | `GGML_SYCL_FA_PARALLEL_BLOCKS=N` | force the split (clamped to the number of KV tiles) |
 | `GGML_SYCL_FA_LOG_SPLIT=1` | log the first 64 split decisions |
 | `GGML_SYCL_FA_TILE_GQA_OPT=0` | tile kernel with one Q head per KV read (ncols2=1) |
+| `GGML_SYCL_FA_TILE_GQA_PAD=1` | pad GQA 5-7 to ncols2=8 and GQA 3 to 4 |
 
 ## Reproduce
 
