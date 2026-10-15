@@ -6695,6 +6695,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return false;
         }
 
+        // Xe2 + Mesa: Q8_0/Q5_K/Q6_K MMVQ also beats DMMV for small k (e.g. MoE expert down projections)
+        if (device->architecture == vk_device_architecture::INTEL_XE2 && device->driver_id == vk::DriverId::eIntelOpenSourceMESA &&
+            (src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K)) {
+            return true;
+        }
+
         if (k < 2048) {
             return false;
         }
