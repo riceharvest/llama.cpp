@@ -1100,6 +1100,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 #define MAT_VEC_FUSION_FLAGS_GLU_A  0x10
 #define MAT_VEC_FUSION_FLAGS_GLU_B  0x20
+#define MAT_VEC_FUSION_FLAGS_GLU_GELU 0x40
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}

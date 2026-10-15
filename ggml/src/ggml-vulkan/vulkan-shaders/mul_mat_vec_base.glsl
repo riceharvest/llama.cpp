@@ -94,6 +94,10 @@ FLOAT_TYPE mat_vec_glu(const FLOAT_TYPE acc, const FLOAT_TYPE other) {
     const bool is_gate = (p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_A) != 0;
     const float g = float(is_gate ? acc : other);
     const float u = float(is_gate ? other : acc);
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_GLU_GELU) != 0) {
+        const float val = 0.79788456080286535587989211986876f*g*(1.0f + 0.044715f*g*g);
+        return FLOAT_TYPE(0.5f*g*(2.0f - 2.0f / (exp(2 * val) + 1)) * u);
+    }
     return FLOAT_TYPE(g / (1.0f + exp(-g)) * u);
 }
 

@@ -6934,6 +6934,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         const ggml_tensor * glu = cgraph->nodes[node_idx + 1];
         d_F0 = ggml_vk_tensor_subbuffer(ctx, glu->src[0] == dst ? glu->src[1] : glu->src[0]);
         fusion_flags |= glu->src[0] == dst ? MAT_VEC_FUSION_FLAGS_GLU_A : MAT_VEC_FUSION_FLAGS_GLU_B;
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_GEGLU) {
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_GLU_GELU;
+        }
     } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
@@ -7947,6 +7950,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         const ggml_tensor * glu = cgraph->nodes[node_idx + 1];
         d_F0 = ggml_vk_tensor_subbuffer(ctx, glu->src[0] == dst ? glu->src[1] : glu->src[0]);
         fusion_flags |= glu->src[0] == dst ? MAT_VEC_FUSION_FLAGS_GLU_A : MAT_VEC_FUSION_FLAGS_GLU_B;
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_GEGLU) {
+            fusion_flags |= MAT_VEC_FUSION_FLAGS_GLU_GELU;
+        }
     } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
@@ -13702,11 +13708,11 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         }
     }
 
-    // mat-vec + split SWIGLU: the mat-vec epilogue computes silu(gate) * up, the other operand is read from data_fuse0
+    // mat-vec + split SWIGLU/GEGLU: the mat-vec epilogue computes act(gate) * up, the other operand is read from data_fuse0
     if (ops.size() == 2 && (ops.begin()[0] == GGML_OP_MUL_MAT || ops.begin()[0] == GGML_OP_MUL_MAT_ID) && ops.begin()[1] == GGML_OP_GLU) {
         const ggml_tensor *mm  = cgraph->nodes[node_idx];
         const ggml_tensor *glu = cgraph->nodes[node_idx + 1];
-        if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        if ((ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU && ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU) || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
             return false;
         }
         if (glu->src[0] != mm && glu->src[1] != mm) {
