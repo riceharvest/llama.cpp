@@ -5633,11 +5633,18 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+        // Xe2: the IQ4 shaders fill a lookup table per workgroup, so large workgroups win for any m
+        if (ctx->device->architecture == vk_device_architecture::INTEL_XE2 && k >= 1024 &&
+            (a_type == GGML_TYPE_IQ4_XS || a_type == GGML_TYPE_IQ4_NL)) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
+        }
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
-            dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+            // Xe2: few rows give too few subgroup-sized workgroups to fill the GPU
+            const bool small_m = ctx->device->architecture == vk_device_architecture::INTEL_XE2 && m <= 512 && k >= 1024;
+            dmmv_wg = small_m ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
     }
