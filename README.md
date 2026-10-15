@@ -1,4 +1,4 @@
-# riceharvest/llama.cpp: Arc Pro B70 Vulkan branches
+# riceharvest/llama.cpp: Arc Pro B70 branches (Vulkan and SYCL)
 
 This branch only holds documentation. The code is in the branches below. Each one is based on llama.cpp master
 `a0e6dc738` (2026-10-14) and was measured there on one **Intel Arc Pro B70** (32 GB, Fedora 43, kernel 7.1.8,
@@ -12,6 +12,8 @@ This branch only holds documentation. The code is in the branches below. Each on
 | [`vk-xe2-matmul-splitk`](https://github.com/riceharvest/llama.cpp/tree/vk-xe2-matmul-splitk) | `4fc6ddd00` | Xe2 split-k rule for few-tile, long-k matmuls | pp512 +3.8% (27B), +11.5% (1.7B) | [split-k](branches/vk-xe2-matmul-splitk.md) |
 | [`vk-fa-cm1-m8`](https://github.com/riceharvest/llama.cpp/tree/vk-fa-cm1-m8) | `bc0999fac` | 8x16x16 coopmat1 flash-attention shader for devices without 16x16x16 | 27B pp512 at 8K +47% vs scalar FA | [FA m8](branches/vk-fa-cm1-m8.md) |
 | [`vk-matvec-glu-fusion`](https://github.com/riceharvest/llama.cpp/tree/vk-matvec-glu-fusion) | `ca985d7ae` | mat-vec epilogue computes SWIGLU/GEGLU (on top of the stack) | **parked, never run on a GPU** | [GLU fusion](branches/vk-matvec-glu-fusion.md) |
+| [`sycl-qwen35moe-fusions`](https://github.com/riceharvest/llama.cpp/tree/sycl-qwen35moe-fusions) | `1c7351082` | **SYCL**: port of the b70-optimization-lab qwen35moe decode fusions (10 env flags, default off) | being tested (lab: 131.5 tok/s on Ornith 1.5) | [qwen35moe fusions](branches/sycl-qwen35moe-fusions.md) |
+| [`sycl-mmid-small-batch`](https://github.com/riceharvest/llama.cpp/tree/sycl-mmid-small-batch) | `4f29be7b3` | **SYCL**: fused MUL_MAT_ID GEMV for 2-8 tokens (speculative-decoding verify) | being tested | [MoE verify](branches/sycl-mmid-small-batch.md) |
 | [`vk-fa-cm1-m8-testknobs`](https://github.com/riceharvest/llama.cpp/tree/vk-fa-cm1-m8-testknobs) | `499668eaa` | the same work with environment knobs for A/B tests; never for upstream | (test branch) | [test knobs](branches/vk-fa-cm1-m8-testknobs.md) |
 
 Old heads are kept as tags: `archive/vk-mmvq-u32-loads-5bf369db4` (had the results file in the tree),
