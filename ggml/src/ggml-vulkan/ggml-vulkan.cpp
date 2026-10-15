@@ -15066,10 +15066,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(hc_post_gate_pattern, j)) {
                 continue;
             }
+            // mat-vec + GLU fusion: keep the GLU right after its mat-vec. The other GLU operand may be earlier in this set.
+            const bool glu_after_mm = graph->nodes[j]->op == GGML_OP_GLU && j == current_set.back() + 1 &&
+                (graph->nodes[j-1]->op == GGML_OP_MUL_MAT || graph->nodes[j-1]->op == GGML_OP_MUL_MAT_ID) &&
+                (graph->nodes[j]->src[0] == graph->nodes[j-1] || graph->nodes[j]->src[1] == graph->nodes[j-1]);
             bool ok = true;
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
+                    !(glu_after_mm && std::find(current_set.begin(), current_set.end(), c) != current_set.end()) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
