@@ -5542,13 +5542,15 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
-    if (ne12 != 1) return false;
+    // up to MMVQ_MAX_BATCH_SIZE tokens (e.g. a speculative-decoding verify batch), one GEMV launch
+    // per token: each token sees the same quantization and kernel as single-token decode
+    if (ne12 < 1 || ne12 > MMVQ_MAX_BATCH_SIZE || src1->ne[3] != 1) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
-    if (ids->ne[1] != 1) return false;
+    if (ids->ne[1] != ne12 || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
 
     const queue_ptr stream           = ctx.stream();
@@ -5563,36 +5565,42 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
+    // src1 is contiguous, so its ne11 * ne12 rows quantize in one launch
+    const int64_t n_src1_rows = ne11 * ne12;
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) n_src1_rows * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) n_src1_rows,
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) n_src1_rows,
             src1_padded_cols, stream);
     }
 
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
 
-    if (use_reorder) {
-        return ggml_sycl_mul_mat_vec_q_id_reorder(
-            src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-            (float *) dst->data, (int) ne10, nrows, n_experts_used,
-            /*expert_weight_stride=*/ src0->nb[2],
-            /*dst_row_stride=*/ dst->nb[1],
-            src1_row_stride, stream);
+    for (int64_t t = 0; t < ne12; ++t) {
+        const char *    src1_t = src1_ddq + (size_t) t * ne11 * bytes_per_qrow;
+        const int32_t * ids_t  = (const int32_t *) ((const char *) ids->data + t * ids->nb[1]);
+        float *         dst_t  = (float *) ((char *) dst->data + t * dst->nb[2]);
+        const bool ok = use_reorder
+            ? ggml_sycl_mul_mat_vec_q_id_reorder(
+                  src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_experts_used,
+                  /*expert_weight_stride=*/ src0->nb[2], /*dst_row_stride=*/ dst->nb[1], src1_row_stride, stream)
+            : ggml_sycl_mul_mat_vec_q_id(
+                  src0->type, src0->data, src1_t, ids_t, dst_t, (int) ne10, nrows, n_experts_used,
+                  /*expert_weight_stride=*/ src0->nb[2], /*dst_row_stride=*/ dst->nb[1], src1_row_stride, stream);
+        // the type check inside does not depend on t, so this can only fail on the first token
+        if (!ok) {
+            GGML_ASSERT(t == 0);
+            return false;
+        }
     }
-    return ggml_sycl_mul_mat_vec_q_id(
-        src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-        (float *) dst->data, (int) ne10, nrows, n_experts_used,
-        /*expert_weight_stride=*/ src0->nb[2],
-        /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+    return true;
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -5651,7 +5659,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
+    if (ne12 <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
