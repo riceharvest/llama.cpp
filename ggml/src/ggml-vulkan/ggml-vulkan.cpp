@@ -3709,17 +3709,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
-            size_t gdn_len;
+            size_t gdn_len, gdn_cf16_len;
             const void * gdn_data;
+            const void * gdn_cf16_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_cf16_len = gated_delta_net_f32_cf16_len;
+                gdn_cf16_data = (const void *)gated_delta_net_f32_cf16_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_cf16_len = gated_delta_net_f32_cf16_nocluster_len;
+                gdn_cf16_data = (const void *)gated_delta_net_f32_cf16_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_cf16_len = gated_delta_net_f32_cf16_shmem_len;
+                gdn_cf16_data = (const void *)gated_delta_net_f32_cf16_shmem_data;
             }
 
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
@@ -3728,6 +3735,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                const std::string cf16_name = std::string(gdn_names[si][kda]) + "_cf16";
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_cf16[si][kda],
+                    cf16_name.c_str(), gdn_cf16_len, gdn_cf16_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -10270,6 +10281,12 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
+    if (cache != nullptr && cache->type == GGML_TYPE_F16) {
+        // same S_v / KDA variant, F16 cache store
+        const uint32_t si  = S_v == 16 ? 0 : S_v == 32 ? 1 : S_v == 64 ? 2 : 3;
+        const uint32_t kda = (dst->src[3]->ne[0] == (int64_t) S_v) ? 1 : 0;
+        pipeline = ctx->device->pipeline_gated_delta_net_cf16[si][kda];
+    }
     GGML_ASSERT(pipeline != nullptr);
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -13583,14 +13600,16 @@ static int ggml_vk_can_fuse_gdn_cache(const ggml_backend_vk_context * ctx, const
     if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off || !ggml_is_contiguous(src)) {
         return 0;
     }
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->buffer == nullptr ||
+    // F32 cache, or F16 (--cache-type-s f16): the kernel converts on store
+    const size_t ts = ggml_type_size(dst->type);
+    if (dst->op != GGML_OP_VIEW || (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) || dst->buffer == nullptr ||
         !ggml_backend_buffer_is_vk(dst->buffer) || get_misalign_bytes(ctx, dst) != 0 ||
         dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
-        dst->nb[0] != sizeof(float) || dst->nb[1] != (size_t) D * sizeof(float) || (dst->nb[2] % sizeof(float)) != 0) {
+        dst->nb[0] != ts || dst->nb[1] != (size_t) D * ts || (dst->nb[2] % ts) != 0) {
         return 0;
     }
     cache       = dst;
-    slot_stride = K > 1 ? (uint32_t) (dst->nb[2] / sizeof(float)) : 0;
+    slot_stride = K > 1 ? (uint32_t) (dst->nb[2] / ts) : 0;
     return skip;
 }
 

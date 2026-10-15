@@ -8,6 +8,12 @@
 #if USE_SUBGROUP_ADD
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
+#if CACHE_F16
+#extension GL_EXT_shader_16bit_storage : require
+#define CACHE_TYPE float16_t
+#else
+#define CACHE_TYPE float
+#endif
 
 // Caller guarantees valid spec constants: S_V % COLS_PER_WG == 0 and S_V % LANES_PER_COLUMN == 0,
 // so no bounds checking is needed.
@@ -45,7 +51,7 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
-layout(binding = 7)           buffer CacheBuf { float data_cache[];      };
+layout(binding = 7)           buffer CacheBuf { CACHE_TYPE data_cache[]; };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -181,7 +187,7 @@ void main() {
                 if (use_cache != 0u) {
                     const uint slot_base = uint(target_slot) * cache_slot_stride + state_out_base;
                     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                        data_cache[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = float(s_shard[r]);
+                        data_cache[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = CACHE_TYPE(s_shard[r]);
                     }
                 } else {
                     const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
@@ -196,7 +202,7 @@ void main() {
     if (K == 1u) {
         if (use_cache != 0u) {
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                data_cache[state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = float(s_shard[r]);
+                data_cache[state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = CACHE_TYPE(s_shard[r]);
             }
         } else {
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
