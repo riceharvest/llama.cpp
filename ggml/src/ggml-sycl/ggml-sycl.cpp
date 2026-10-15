@@ -6847,6 +6847,21 @@ static bool ggml_sycl_qwen35moe_gdn_state_io_enabled() {
 // GDN workgroup owns one state column and loads it fully before writing, so the
 // kernel can safely read and write the persistent buffer in place and elide
 // the GET_ROWS launch as well.
+// Test knob: GGML_SYCL_FUSION_WHYNOT=1 logs (up to 8 times per call site) why a qwen35moe matcher rejected a candidate.
+static bool ggml_sycl_fusion_whynot() {
+    static const bool on = [] { const char * v = std::getenv("GGML_SYCL_FUSION_WHYNOT"); return v && std::atoi(v) != 0; }();
+    return on;
+}
+#define QWEN35MOE_WHYNOT(...)                                                \
+    do {                                                                     \
+        if (ggml_sycl_fusion_whynot()) {                                     \
+            static int whynot_n = 0;                                         \
+            if (whynot_n++ < 8) {                                            \
+                GGML_LOG_INFO("qwen35moe whynot " __VA_ARGS__);              \
+            }                                                                \
+        }                                                                    \
+    } while (0)
+
 static bool ggml_sycl_find_qwen35moe_gdn_state_io(
         const ggml_cgraph * cgraph, int node_idx,
         ggml_sycl_qwen35moe_gdn_state_io_match & match) {
@@ -6857,6 +6872,18 @@ static bool ggml_sycl_find_qwen35moe_gdn_state_io(
 
     ggml_tensor * get = cgraph->nodes[node_idx];
     constexpr int64_t state_elems = 128LL * 128 * 32;
+    if (get != nullptr && get->op == GGML_OP_GET_ROWS && get->src[0] != nullptr && get->src[1] != nullptr &&
+        (ggml_nelements(get) % state_elems == 0 || ggml_nelements(get->src[0]) % state_elems == 0)) {
+        QWEN35MOE_WHYNOT("gdn_state_io candidate '%s': type %d src0 '%s' type %d ne [%lld %lld %lld %lld] get ne [%lld %lld %lld %lld] "
+                         "nrows get/src0 %lld/%lld idx n %lld contig %d/%d same_data %d\n",
+                         get->name, (int) get->type, get->src[0]->name, (int) get->src[0]->type,
+                         (long long) get->src[0]->ne[0], (long long) get->src[0]->ne[1], (long long) get->src[0]->ne[2],
+                         (long long) get->src[0]->ne[3], (long long) get->ne[0], (long long) get->ne[1],
+                         (long long) get->ne[2], (long long) get->ne[3], (long long) ggml_nrows(get),
+                         (long long) ggml_nrows(get->src[0]), (long long) ggml_nelements(get->src[1]),
+                         (int) ggml_is_contiguous(get), (int) ggml_is_contiguous(get->src[0]),
+                         (int) (get->data == get->src[0]->data));
+    }
     if (get == nullptr || get->op != GGML_OP_GET_ROWS ||
         get->src[0] == nullptr || get->src[1] == nullptr ||
         get->type != GGML_TYPE_F32 || get->src[0]->type != GGML_TYPE_F32 ||
@@ -6894,12 +6921,23 @@ static bool ggml_sycl_find_qwen35moe_gdn_state_io(
         gdn->src[2]->type != GGML_TYPE_F32 || gdn->src[2]->ne[0] != 128 ||
         gdn->src[2]->ne[1] != 32 || gdn->src[2]->ne[2] != 1 ||
         gdn->src[2]->ne[3] != 1 || ggml_get_op_params_i32(gdn, 0) != 1) {
+        if (gdn == nullptr) {
+            QWEN35MOE_WHYNOT("gdn_state_io '%s': no GATED_DELTA_NET with src[5] == this GET_ROWS within 32 nodes\n", get->name);
+        } else {
+            QWEN35MOE_WHYNOT("gdn_state_io '%s': gdn '%s' src2 %s ne [%lld %lld %lld %lld] param0 %d\n", get->name, gdn->name,
+                             gdn->src[2] ? ggml_type_name(gdn->src[2]->type) : "null",
+                             gdn->src[2] ? (long long) gdn->src[2]->ne[0] : -1LL, gdn->src[2] ? (long long) gdn->src[2]->ne[1] : -1LL,
+                             gdn->src[2] ? (long long) gdn->src[2]->ne[2] : -1LL, gdn->src[2] ? (long long) gdn->src[2]->ne[3] : -1LL,
+                             ggml_get_op_params_i32(gdn, 0));
+        }
         return false;
     }
 
     ggml_sycl_gated_delta_net_fused_cache cache{};
     const int nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, gdn_idx, cache);
     if (nodes_to_skip <= 0 || cache.data != get->src[0]->data || cache.slot_stride != 0) {
+        QWEN35MOE_WHYNOT("gdn_state_io '%s': gdn cache fusion skip %d, cache.data==state %d, slot_stride %lld\n", get->name,
+                         nodes_to_skip, (int) (cache.data == get->src[0]->data), (long long) cache.slot_stride);
         return false;
     }
 
@@ -7200,6 +7238,18 @@ static bool ggml_sycl_find_qwen35moe_concat_state_direct(
     }
 
     ggml_tensor * get_rows = cgraph->nodes[node_idx];
+    if (get_rows != nullptr && get_rows->op == GGML_OP_GET_ROWS && get_rows->src[0] != nullptr && get_rows->src[1] != nullptr &&
+        (std::strstr(get_rows->name, "conv") != nullptr || ggml_nelements(get_rows) % (3 * 8192) == 0)) {
+        QWEN35MOE_WHYNOT("concat_state_direct candidate '%s': type %d src0 '%s' ne [%lld %lld %lld %lld] get ne [%lld %lld %lld %lld] "
+                         "nrows get/src0 %lld/%lld idx n %lld contig %d/%d output %d\n",
+                         get_rows->name, (int) get_rows->type, get_rows->src[0]->name,
+                         (long long) get_rows->src[0]->ne[0], (long long) get_rows->src[0]->ne[1],
+                         (long long) get_rows->src[0]->ne[2], (long long) get_rows->src[0]->ne[3],
+                         (long long) get_rows->ne[0], (long long) get_rows->ne[1], (long long) get_rows->ne[2],
+                         (long long) get_rows->ne[3], (long long) ggml_nrows(get_rows), (long long) ggml_nrows(get_rows->src[0]),
+                         (long long) ggml_nelements(get_rows->src[1]), (int) ggml_is_contiguous(get_rows),
+                         (int) ggml_is_contiguous(get_rows->src[0]), (int) ((get_rows->flags & GGML_TENSOR_FLAG_OUTPUT) != 0));
+    }
     if (get_rows == nullptr || get_rows->op != GGML_OP_GET_ROWS ||
         std::strstr(get_rows->name, "conv_states-") == nullptr ||
         get_rows->src[0] == nullptr || get_rows->src[1] == nullptr ||
@@ -7234,6 +7284,8 @@ static bool ggml_sycl_find_qwen35moe_concat_state_direct(
                 concat = consumer;
                 concat_idx = j;
             } else {
+                QWEN35MOE_WHYNOT("concat_state_direct '%s': other consumer '%s' op %s src %d\n", get_rows->name,
+                                 consumer->name, ggml_op_name(consumer->op), s);
                 return false;
             }
         }
@@ -7246,12 +7298,19 @@ static bool ggml_sycl_find_qwen35moe_concat_state_direct(
 
     const int cpy_idx = ggml_sycl_find_qwen35moe_concat_state(cgraph, concat_idx);
     if (cpy_idx < 0) {
+        QWEN35MOE_WHYNOT("concat_state_direct '%s': concat '%s' found, but no concat_state copy-back after it\n",
+                         get_rows->name, concat->name);
         return false;
     }
     ggml_tensor * cpy = cgraph->nodes[cpy_idx];
     if (cpy == nullptr || cpy->src[1] == nullptr ||
         cpy->src[1]->data != get_rows->src[0]->data ||
         ggml_nelements(cpy->src[1]) != ggml_nelements(get_rows->src[0])) {
+        QWEN35MOE_WHYNOT("concat_state_direct '%s': copy-back '%s' does not write the gathered state (same data %d, n %lld vs %lld)\n",
+                         get_rows->name, cpy ? cpy->name : "null",
+                         (int) (cpy && cpy->src[1] && cpy->src[1]->data == get_rows->src[0]->data),
+                         cpy && cpy->src[1] ? (long long) ggml_nelements(cpy->src[1]) : -1LL,
+                         (long long) ggml_nelements(get_rows->src[0]));
         return false;
     }
     const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
