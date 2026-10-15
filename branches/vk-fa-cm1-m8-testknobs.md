@@ -14,5 +14,5 @@ Knobs (unset = the same behaviour as the clean branches):
 | `GGML_VK_XE2_Q8_SMALLK_DMMV` | send small-k Q8_0 back to DMMV |
 | `GGML_VK_MM_TILE`, `GGML_VK_MM_TILE_MAX_M`, `GGML_VK_MM_SPLITK` | force matmul tile size and split-k |
 | `GGML_VK_XE_FA_PH2_SPLIT`, `GGML_VK_XE_FA_PCHUNK`, `GGML_VK_XE_FA_VDIM`, `GGML_VK_XE_FA_SKIP` | xe_fa split count, chunk size, and skipping a phase (timing only, wrong output) |
-| `GGML_VK_FA_SPLITK_MUL`, `GGML_VK_FA_SPARSE_DISABLE` | FA split-k and sparse-mask experiments |
+| `GGML_VK_FA_SPLITK_MUL` | FA split-k multiplier experiment |
 | `GGML_VK_BARRIER_COMPUTE_ONLY`, `GGML_VK_NO_BARRIER_TIMING` | barrier experiments (the second gives wrong output; timing bound only) |
