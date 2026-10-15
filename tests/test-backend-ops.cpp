@@ -12051,6 +12051,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA ratios that are not a power of 2 (Qwen3.8-27B: 24 Q heads on 4 K/V heads), decode and small batches,
+    // short and long KV (long KV exercises a large KV split)
+    for (int hsk : { 128, 256 }) {
+        for (int nr2 : { 3, 6 }) {
+            for (int kv : { 512, 4096 }) {
+                for (int nb : { 1, 3 }) {
+                    for (bool sinks : { false, true }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            hsk, hsk, 4, {nr2, 1}, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                    }
+                }
+            }
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
