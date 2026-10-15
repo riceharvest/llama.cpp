@@ -493,6 +493,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // The shared-expert gate (1 x n_embd) reads the same input as the router (n_expert x n_embd). Adding it to the graph
+    // right before the MoE block puts the two small mat-vecs next to each other, so a backend can run them in one
+    // dispatch (Vulkan: MUL_MAT_PAIR). The result is the same either way.
+    ggml_tensor * shared_gate = nullptr;
+    if (model.layers[il].ffn_up_shexp != nullptr) {
+        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+        ggml_build_forward_expand(gf, shared_gate);
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -523,9 +533,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
 
         // Apply shared expert gating as in the reference implementation
         // The shared expert has its own gate that is sigmoided
-        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
+        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token), computed above
 
         // Apply sigmoid to the gate
         shared_gate = ggml_sigmoid(ctx0, shared_gate);

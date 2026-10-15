@@ -4980,6 +4980,42 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// two F32 mat-vecs sharing one input vector, adjacent in the graph (Vulkan fuses them: MUL_MAT_PAIR),
+// e.g. a MoE router and a shared-expert gate
+struct test_mul_mat_pair : public test_case {
+    const int64_t k;
+    const int64_t m0;
+    const int64_t m1;
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, m0, m1);
+    }
+
+    test_mul_mat_pair(int64_t k = 2048, int64_t m0 = 1, int64_t m1 = 256) : k(k), m0(m0), m1(m1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m0);
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m1);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(a0, "a0");
+        ggml_set_name(a1, "a1");
+        ggml_set_name(b,  "b");
+        ggml_tensor * d0 = ggml_mul_mat(ctx, a0, b);
+        ggml_tensor * d1 = ggml_mul_mat(ctx, a1, b);
+        // concat visits d0 then d1, so the two mat-vecs are adjacent nodes
+        ggml_tensor * out = ggml_concat(ctx, d0, d1, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_PAIR";
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -11973,6 +12009,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
 
     // gdn + cache cpy fusion (K > 1)
+    test_cases.emplace_back(new test_mul_mat_pair(2048,   1, 256)); // qwen35moe: shared-expert gate + router
+    test_cases.emplace_back(new test_mul_mat_pair(2048, 256,   1));
+    test_cases.emplace_back(new test_mul_mat_pair(4096,  32,  64));
+    test_cases.emplace_back(new test_mul_mat_pair(  64,   1,   1));
+    test_cases.emplace_back(new test_mul_mat_pair( 100,   3,   5)); // k not a multiple of the workgroup size
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));

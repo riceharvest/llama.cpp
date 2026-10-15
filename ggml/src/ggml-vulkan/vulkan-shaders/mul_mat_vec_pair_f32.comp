@@ -1,0 +1,69 @@
+#version 450
+
+// Two F32 matrix-vector products that share the same input vector, in one dispatch:
+// rows [0, nrows0) of D0 = A0 x B and rows [0, nrows1) of D1 = A1 x B. One workgroup per output row.
+// Used for small router / gate projections (e.g. a 256-row MoE router and a 1-row shared-expert gate) whose
+// separate launches cost more than their memory traffic.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A0 {float data_a0[];};
+layout (binding = 1) readonly buffer A1 {float data_a1[];};
+layout (binding = 2) readonly buffer B {float data_b[];};
+layout (binding = 3) writeonly buffer D0 {float data_d0[];};
+layout (binding = 4) writeonly buffer D1 {float data_d1[];};
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint nrows0;
+    uint nrows1;
+    uint stride_a0; // row stride of A0, in elements
+    uint stride_a1; // row stride of A1, in elements
+} p;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
+
+shared float tmp[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.nrows0 + p.nrows1) {
+        return;
+    }
+    // uniform per workgroup
+    const bool second = row >= p.nrows0;
+    const uint r = second ? row - p.nrows0 : row;
+
+    float sum = 0.0;
+    if (second) {
+        const uint base = r * p.stride_a1;
+        for (uint k = tid; k < p.ncols; k += BLOCK_SIZE) {
+            sum += data_a1[base + k] * data_b[k];
+        }
+    } else {
+        const uint base = r * p.stride_a0;
+        for (uint k = tid; k < p.ncols; k += BLOCK_SIZE) {
+            sum += data_a0[base + k] * data_b[k];
+        }
+    }
+
+    tmp[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            tmp[tid] += tmp[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        if (second) {
+            data_d1[r] = tmp[0];
+        } else {
+            data_d0[r] = tmp[0];
+        }
+    }
+}

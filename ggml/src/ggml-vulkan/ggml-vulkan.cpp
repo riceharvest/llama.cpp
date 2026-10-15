@@ -3265,6 +3265,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_pair_f32, "mul_mat_vec_pair_f32", mul_mat_vec_pair_f32_len, mul_mat_vec_pair_f32_data, "main", 5, sizeof(vk_mat_vec_pair_push_constants), {1, 1, 1}, {64}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -7069,6 +7070,27 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
             d_F0,
             d_F1,
         }, pc, { 1, (uint32_t)ne01, workgroups_z });
+}
+
+// nodes[node_idx] and nodes[node_idx + 1]: two F32 MUL_MATs with the same single-row F32 src1 (see ggml_vk_can_fuse_mul_mat_pair)
+static void ggml_vk_mul_mat_pair(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * d0 = cgraph->nodes[node_idx];
+    const ggml_tensor * d1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * a0 = d0->src[0];
+    const ggml_tensor * a1 = d1->src[0];
+    const ggml_tensor * b  = d0->src[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_pair_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_mat_vec_pair_push_constants pc = {
+        (uint32_t) a0->ne[0], (uint32_t) a0->ne[1], (uint32_t) a1->ne[1],
+        (uint32_t) (a0->nb[1] / sizeof(float)), (uint32_t) (a1->nb[1] / sizeof(float)),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a0), ggml_vk_tensor_subbuffer(ctx, a1), ggml_vk_tensor_subbuffer(ctx, b),
+          ggml_vk_tensor_subbuffer(ctx, d0), ggml_vk_tensor_subbuffer(ctx, d1) },
+        pc, { (uint32_t) (a0->ne[1] + a1->ne[1]), 1, 1 });
 }
 
 static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -12800,7 +12822,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL_MAT:
-        ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_mul_mat_pair) {
+            ggml_vk_mul_mat_pair(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
     case GGML_OP_MUL_MAT_ID:
@@ -13621,6 +13647,35 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
            scale_in->src[0]->type == GGML_TYPE_F32 &&
            ggml_are_same_shape(scale_in->src[0], scale_out);
+}
+
+// Two adjacent MUL_MATs with F32 weights reading the same single-row F32 vector, e.g. a MoE router (256 x n_embd) and a
+// shared-expert gate (1 x n_embd): one dispatch instead of two small launches. GGML_VK_DISABLE_MUL_MAT_PAIR=1 turns it off.
+static bool ggml_vk_can_fuse_mul_mat_pair(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_MUL_MAT_PAIR") != nullptr;
+    if (disabled || node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * d0 = cgraph->nodes[node_idx];
+    const ggml_tensor * d1 = cgraph->nodes[node_idx + 1];
+    if (d0->op != GGML_OP_MUL_MAT || d1->op != GGML_OP_MUL_MAT || d0->src[1] != d1->src[1] ||
+        d1->src[0] == d0 || d1->src[1] == d0) {
+        return false;
+    }
+    const ggml_tensor * b = d0->src[1];
+    if (b->type != GGML_TYPE_F32 || ggml_nrows(b) != 1 || !ggml_is_contiguous(b)) {
+        return false;
+    }
+    for (const ggml_tensor * d : { d0, d1 }) {
+        const ggml_tensor * a = d->src[0];
+        if (a->type != GGML_TYPE_F32 || a->ne[0] != b->ne[0] || a->ne[2] != 1 || a->ne[3] != 1 ||
+            a->nb[0] != sizeof(float) || (a->nb[1] % sizeof(float)) != 0 ||
+            d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || ggml_nrows(d) != 1 ||
+            get_misalign_bytes(ctx, a) != 0 || get_misalign_bytes(ctx, d) != 0) {
+            return false;
+        }
+    }
+    return get_misalign_bytes(ctx, b) == 0 && d0->src[0]->ne[1] + d1->src[0]->ne[1] <= 65535;
 }
 
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
@@ -14471,6 +14526,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_mul_mat_pair = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14479,6 +14535,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_mul_mat_pair(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_ops_write_mask |= 1 << 0; // both mat-vecs write their own output
+                ctx->fused_mul_mat_pair = true;
+                fusion_string = "MUL_MAT_PAIR";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -14713,6 +14776,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_mul_mat_pair = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }

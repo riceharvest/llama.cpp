@@ -41,6 +41,15 @@ struct vk_mat_vec_p021_push_constants {
     uint32_t fusion_flags;
 };
 
+// two F32 mat-vecs sharing one input vector (mul_mat_vec_pair_f32.comp)
+struct vk_mat_vec_pair_push_constants {
+    uint32_t ncols;
+    uint32_t nrows0;
+    uint32_t nrows1;
+    uint32_t stride_a0;
+    uint32_t stride_a1;
+};
+
 struct vk_mat_vec_nc_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;
