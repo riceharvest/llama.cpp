@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -5093,6 +5094,353 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// qwen35moe decode fusions (SYCL, enabled with GGML_SYCL_FUSED_QWEN35MOE_* env flags).
+// Each case builds the exact one-token sub-graph and tensor names the backend matcher expects
+// (Qwen3.5/3.6-35B-A3B shapes), so with the flags set the fused kernel runs and is compared
+// against the CPU backend; without them the same graph runs unfused.
+static void init_qwen35moe_fusion_tensors(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (ggml_is_view_op(t->op)) {
+            continue;
+        }
+        if (t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64) {
+            // single-row indices (row 0) and small IMRoPE positions
+            std::vector<int64_t> v64(ggml_nelements(t), 0);
+            std::vector<int32_t> v32(ggml_nelements(t), 0);
+            if (strncmp(t->name, "pos", 3) == 0) {
+                for (size_t i = 0; i < v32.size(); ++i) {
+                    v32[i] = 7 + (int32_t) i;
+                }
+            }
+            if (strcmp(t->name, "k_idx") == 0) {
+                v64[0] = 1;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                ggml_backend_tensor_set(t, v32.data(), 0, ggml_nbytes(t));
+            } else {
+                ggml_backend_tensor_set(t, v64.data(), 0, ggml_nbytes(t));
+            }
+        } else {
+            init_tensor_uniform(t);
+        }
+    }
+}
+
+// MOE_ADD_REDUCE: the ordered sum of the 8 weighted expert rows (7 ADDs over views)
+struct test_qwen35moe_moe_add_reduce : public test_case {
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_MOE_ADD_REDUCE"; }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weighted = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 8, 1);
+        ggml_set_name(weighted, "weighted");
+        ggml_tensor * sum = nullptr;
+        for (int e = 0; e < 8; ++e) {
+            ggml_tensor * row = ggml_view_2d(ctx, weighted, 2048, 1, weighted->nb[2], e * weighted->nb[1]);
+            sum = sum == nullptr ? row : ggml_add(ctx, sum, row);
+        }
+        ggml_set_name(sum, "moe_out");
+        return sum;
+    }
+};
+
+// RESIDUAL_RMS_NORM: residual ADD + RMS_NORM + weight MUL; the ADD result (next residual) is kept
+struct test_qwen35moe_residual_rms_norm : public test_case {
+    const std::string add_name;
+    ggml_tensor * add = nullptr;
+    ggml_tensor * out = nullptr;
+
+    test_qwen35moe_residual_rms_norm(std::string add_name = "l_out-0") : add_name(std::move(add_name)) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_RESIDUAL_RMS_NORM"; }
+    std::string vars() override { return "add=" + add_name; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { add, out }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        add = ggml_add(ctx, a, b);
+        ggml_set_name(add, add_name.c_str());
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, add, 1e-6f), w);
+        return out;
+    }
+};
+
+// MOE_SHARED_RESIDUAL_RMS (+ MOE_GATE_RESIDUAL_RMS with gate=true): routed + shared expert ADD,
+// residual ADD, RMS_NORM, MUL; with the gate, the shared expert is first scaled by sigmoid(gate)
+struct test_qwen35moe_moe_residual_rms : public test_case {
+    const bool gate;
+    ggml_tensor * shared_gated = nullptr;
+    ggml_tensor * ffn_out = nullptr;
+    ggml_tensor * l_out = nullptr;
+    ggml_tensor * out = nullptr;
+
+    test_qwen35moe_moe_residual_rms(bool gate = false) : gate(gate) {}
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return gate ? "QWEN35MOE_MOE_GATE_RESIDUAL_RMS" : "QWEN35MOE_MOE_SHARED_RESIDUAL_RMS";
+    }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (gate) {
+            return { shared_gated, ffn_out, l_out, out };
+        }
+        return { ffn_out, l_out, out };
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * routed   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        ggml_tensor * shared   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        ggml_tensor * residual = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        ggml_tensor * w        = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
+        if (gate) {
+            ggml_tensor * gate_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * sig = ggml_sigmoid(ctx, gate_in);
+            ggml_set_name(sig, "shared_expert_gate_sigmoid-0");
+            shared_gated = ggml_mul(ctx, shared, sig);
+            ggml_set_name(shared_gated, "ffn_shexp_gated-0");
+            shared = shared_gated;
+        }
+        ffn_out = ggml_add(ctx, routed, shared);
+        ggml_set_name(ffn_out, "ffn_out-0");
+        l_out = ggml_add(ctx, ffn_out, residual);
+        ggml_set_name(l_out, "l_out-0");
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, l_out, 1e-6f), w);
+        return out;
+    }
+};
+
+// CONCAT_STATE (+ CONCAT_STATE_DIRECT with direct=true): linear-attention conv state
+// gather -> concat with the new token -> write the shifted state back -> SSM_CONV + SILU
+struct test_qwen35moe_conv_state : public test_case {
+    const bool direct;
+    ggml_tensor * get_rows = nullptr;
+    ggml_tensor * concat = nullptr;
+    ggml_tensor * cpy = nullptr;
+    ggml_tensor * silu = nullptr;
+
+    test_qwen35moe_conv_state(bool direct = false) : direct(direct) {}
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return direct ? "QWEN35MOE_CONCAT_STATE_DIRECT" : "QWEN35MOE_CONCAT_STATE";
+    }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = { concat, cpy, silu };
+        if (direct) {
+            nodes.push_back(get_rows);
+        }
+        return nodes;
+    }
+    void initialize_tensors(ggml_context * ctx) override { init_qwen35moe_fusion_tensors(ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t channels = 8192;
+        ggml_tensor * states_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * channels, 1);
+        ggml_set_name(states_all, "conv_states_all");
+        ggml_tensor * states;
+        if (direct) {
+            ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(idx, "s_idx");
+            get_rows = ggml_get_rows(ctx, states_all, idx);
+            ggml_set_name(get_rows, "conv_states-0");
+            states = get_rows;
+        } else {
+            states = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * channels, 1);
+        }
+        states = ggml_reshape_3d(ctx, states, 3, channels, 1);
+
+        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, 1);
+        concat = ggml_concat(ctx, states, ggml_transpose(ctx, qkv), 0);
+        ggml_set_name(concat, "conv_input-0");
+
+        ggml_tensor * last = ggml_view_3d(ctx, concat, 3, channels, 1, concat->nb[1], concat->nb[2],
+                                          ggml_row_size(concat->type, 1));
+        ggml_set_name(last, "conv_state_last-0");
+        ggml_tensor * update = ggml_view_2d(ctx, states_all, 3 * channels, 1, states_all->nb[1], 0);
+        ggml_set_name(update, "conv_state_update-0");
+        cpy = ggml_cpy(ctx, last, update);
+
+        ggml_tensor * kernel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, concat, kernel);
+        ggml_set_name(conv, "conv_output_raw-0");
+        silu = ggml_silu(ctx, conv);
+
+        // cpy first, so it is the first node computed after the concat, as in the model graph
+        return ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, silu));
+    }
+};
+
+// MOE_GATE_UP: routed gate + up MUL_MAT_ID (Q4_K, 256 experts, top-8) + SWIGLU in one kernel
+struct test_qwen35moe_moe_gate_up : public test_case {
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_MOE_GATE_UP"; }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, 2048, 512, 256);
+        ggml_set_name(gate_w, "blk.0.ffn_gate_exps.weight");
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, 2048, 512, 256);
+        ggml_set_name(up_w, "blk.0.ffn_up_exps.weight");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2048, 1, 1);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, up_w, x, ids);
+        return ggml_swiglu_split(ctx, gate, up);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> experts(256);
+                std::iota(experts.begin(), experts.end(), 0);
+                std::shuffle(experts.begin(), experts.end(), rng);
+                ggml_backend_tensor_set(t, experts.data(), 0, 8 * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GDN_RMS_GATE: RMS_NORM of the GDN output * ssm_norm weight * silu(z projection)
+struct test_qwen35moe_gdn_rms_gate : public test_case {
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_GDN_RMS_GATE"; }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 32, 1, 1);
+        ggml_set_name(x, "attn_output-0");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        ggml_set_name(w, "blk.0.ssm_norm.weight");
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+
+        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 1);
+        ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 4096);
+        ggml_tensor * z  = ggml_mul_mat(ctx, wz, h);
+        ggml_set_name(z, "z-0");
+        ggml_tensor * gate = ggml_silu(ctx, ggml_reshape_4d(ctx, z, 128, 32, 1, 1));
+        return ggml_mul(ctx, normed, gate);
+    }
+};
+
+// GDN_STATE_IO: GATED_DELTA_NET reads its recurrent state in place from the persistent buffer
+// instead of the GET_ROWS copy, then the existing cache fusion writes it back (one slot, K = 1)
+struct test_qwen35moe_gdn_state_io : public test_case {
+    ggml_tensor * cpy = nullptr;
+    ggml_tensor * attn = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_GDN_STATE_IO"; }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy, attn }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = 128, H = 32, D = S * S * H;
+        ggml_tensor * state_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 1);
+        ggml_set_name(state_all, "state_all");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(idx, "s_idx");
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, state_all, idx), S, S, H, 1);
+
+        ggml_tensor * q    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1), 1e-6f);
+        ggml_tensor * k    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1), 1e-6f);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        ggml_set_name(g, "g");
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        attn = ggml_view_4d(ctx, gdn, S, H, 1, 1, ggml_row_size(gdn->type, S), ggml_row_size(gdn->type, S * H),
+                            ggml_row_size(gdn->type, S * H), 0);
+        ggml_tensor * tail = ggml_view_3d(ctx, gdn, D, 1, 1, ggml_row_size(gdn->type, D), ggml_row_size(gdn->type, D),
+                                          ggml_row_size(gdn->type, S * H));
+        ggml_tensor * dst = ggml_view_3d(ctx, state_all, D, 1, 1, ggml_row_size(state_all->type, D),
+                                         ggml_row_size(state_all->type, D), 0);
+        cpy = ggml_cpy(ctx, tail, dst);
+        return ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, attn));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                const int32_t zero = 0;
+                ggml_backend_tensor_set(t, &zero, 0, sizeof(zero));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "state_all") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// QK_NORM_ROPE: q/k RMS_NORM * weight + IMRoPE in one kernel; K goes straight to the F16 cache
+// row through SET_ROWS, Q stays in place for FLASH_ATTN_EXT (16 q heads, 2 kv heads, dim 256)
+struct test_qwen35moe_qk_norm_rope : public test_case {
+    ggml_tensor * set_rows = nullptr;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN35MOE_QK_NORM_ROPE"; }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { set_rows, out }; }
+    void initialize_tensors(ggml_context * ctx) override { init_qwen35moe_fusion_tensors(ctx); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hd = 256, n_head = 16, n_head_kv = 2, n_kv = 4;
+        int sections[GGML_MROPE_SECTIONS] = { 11, 11, 10, 0 };
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_set_name(pos, "pos");
+
+        auto norm_rope = [&](int64_t n_heads, const char * w_name, const char * name) {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, n_heads, 1);
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+            ggml_set_name(w, w_name);
+            ggml_tensor * r = ggml_rope_multi_inplace(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), pos, nullptr,
+                                                      64, sections, GGML_ROPE_TYPE_IMROPE, 262144, 10000000.0f,
+                                                      1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            ggml_set_name(r, name);
+            return r;
+        };
+
+        ggml_tensor * q = norm_rope(n_head, "blk.0.attn_q_norm.weight", "Qcur-0");
+        q = ggml_permute(ctx, ggml_view_3d(ctx, q, hd, n_head, 1, q->nb[1], q->nb[2], 0), 0, 2, 1, 3);
+
+        ggml_tensor * k = norm_rope(n_head_kv, "blk.0.attn_k_norm.weight", "Kcur-0");
+        ggml_tensor * k_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hd * n_head_kv, n_kv);
+        ggml_tensor * k_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+        ggml_set_name(k_idx, "k_idx");
+        set_rows = ggml_set_rows(ctx, k_cache, ggml_view_2d(ctx, k, hd * n_head_kv, 1, k->nb[2], 0), k_idx);
+        ggml_tensor * kk = ggml_permute(ctx, ggml_view_3d(ctx, set_rows, hd, n_head_kv, n_kv,
+                                                          ggml_row_size(GGML_TYPE_F16, hd), set_rows->nb[1], 0),
+                                        0, 2, 1, 3);
+        ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hd, n_kv, n_head_kv);
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
+        out = ggml_flash_attn_ext(ctx, q, kk, v_cache, mask, 1.0f / 16.0f, 0.0f, 0.0f);
+        return out;
     }
 };
 
@@ -11978,6 +12326,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // qwen35moe decode fusions (SYCL: run with the GGML_SYCL_FUSED_QWEN35MOE_* flags set)
+    test_cases.emplace_back(new test_qwen35moe_moe_add_reduce());
+    test_cases.emplace_back(new test_qwen35moe_residual_rms_norm("l_out-0"));
+    test_cases.emplace_back(new test_qwen35moe_residual_rms_norm("attn_residual-0"));
+    test_cases.emplace_back(new test_qwen35moe_moe_residual_rms(false));
+    test_cases.emplace_back(new test_qwen35moe_moe_residual_rms(true));
+    test_cases.emplace_back(new test_qwen35moe_conv_state(false));
+    test_cases.emplace_back(new test_qwen35moe_conv_state(true));
+    test_cases.emplace_back(new test_qwen35moe_moe_gate_up());
+    test_cases.emplace_back(new test_qwen35moe_gdn_rms_gate());
+    test_cases.emplace_back(new test_qwen35moe_gdn_state_io());
+    test_cases.emplace_back(new test_qwen35moe_qk_norm_rope());
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
