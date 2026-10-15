@@ -9,7 +9,10 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_Q1_0);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(src0));
+    // src0 may be a view with strided rows (e.g. V sliced out of a fused QKV tensor in the LiLiCorr drafter): only its
+    // elements within a row must be contiguous; rows and planes are addressed through nb01 / nb02 / nb03
+    GGML_ASSERT(src0->nb[0] == sizeof(float) || src0->type == GGML_TYPE_Q1_0);
+    GGML_ASSERT(src0->type != GGML_TYPE_Q1_0 || ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -34,6 +37,7 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     ggml_sycl_pool_alloc<float> src0_as_f32(ctx.pool());
     int64_t src0_nb02 = nb02;
     int64_t src0_nb03 = nb03;
+    int64_t lda       = nb01 / (int64_t) sizeof(float);
     if (src0->type == GGML_TYPE_Q1_0) {
         scope_op_debug_print scope_dbg_print(__func__, "/to_fp32_sycl", dst, /*num_src=*/2,
                                              " : converting src0 Q1_0 to fp32");
@@ -45,6 +49,7 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
         // Dequantized src0 buffer is contiguous fp32 [ne00, ne01, ne02, ne03].
         src0_nb02 = ne00 * ne01 * (int64_t) sizeof(float);
         src0_nb03 = ne00 * ne01 * ne02 * (int64_t) sizeof(float);
+        lda       = ne00;
     }
 
     // GEMM parameters
@@ -55,6 +60,7 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     const bool src1_T = ggml_is_transposed(src1);
     const oneapi::mkl::transpose src1_op = src1_T ? oneapi::mkl::transpose::nontrans : oneapi::mkl::transpose::trans;
     const int64_t ldb = (src1_T ? nb10 : nb11) / sizeof(float);
+    GGML_ASSERT((src1_T ? nb11 : nb10) == sizeof(float));
 
     const int64_t r2 = ne2 / ne02;
     const int64_t r3 = ne3 / ne03;
@@ -72,7 +78,7 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
                 // Perform matrix multiplication using oneMKL GEMM
                 oneapi::mkl::blas::column_major::gemm(*stream, oneapi::mkl::transpose::nontrans, src1_op,
-                                                      ne0, ne1, ne01, alpha, src0_plane, ne00,
+                                                      ne0, ne1, ne01, alpha, src0_plane, lda,
                                                       src1_plane, ldb, beta, dst_plane, ne0);
             }
         }

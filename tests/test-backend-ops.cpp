@@ -5758,6 +5758,40 @@ struct test_out_prod : public test_case {
     }
 };
 
+// GGML_OP_OUT_PROD with src0 = a strided view, as in the LiLiCorr drafter (src/models/dflash.cpp): V is a view of a fused
+// QKV tensor (rows strided by the whole QKV row, heads by head_dim) and src1 is a transposed attention matrix
+struct test_out_prod_qkv_view : public test_case {
+    const int64_t head_dim;
+    const int64_t nodes;
+    const int64_t heads;
+    const int64_t n_blocks;
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, nodes, heads, n_blocks);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_out_prod_qkv_view(int64_t head_dim = 32, int64_t nodes = 24, int64_t heads = 4, int64_t n_blocks = 2)
+        : head_dim(head_dim), nodes(nodes), heads(heads), n_blocks(n_blocks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hidden = head_dim * heads;
+        ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 * hidden, nodes, n_blocks);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * v = ggml_view_4d(ctx, qkv, head_dim, nodes, heads, n_blocks,
+                qkv->nb[1], head_dim * qkv->nb[0], qkv->nb[2], 2 * hidden * qkv->nb[0]);
+        ggml_set_name(v, "v");
+        ggml_tensor * attn = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nodes, nodes, heads, n_blocks);
+        ggml_set_name(attn, "attn");
+        ggml_tensor * out = ggml_out_prod(ctx, v, ggml_transpose(ctx, attn));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SQR
 struct test_sqr : public test_case {
     const ggml_type type;
@@ -11131,6 +11165,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // src0 = a strided view of a fused QKV tensor (LiLiCorr drafter)
+    test_cases.emplace_back(new test_out_prod_qkv_view(32, 24, 4, 2));
+    test_cases.emplace_back(new test_out_prod_qkv_view(64, 7, 8, 3));
+    test_cases.emplace_back(new test_out_prod_qkv_view(128, 16, 2, 1));
 
     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
     for (int64_t ne2 : {1, 8, 16, 32}) {
