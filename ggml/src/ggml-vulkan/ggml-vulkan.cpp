@@ -5644,12 +5644,30 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+        // Xe2: the IQ4 shaders fill a lookup table per workgroup, so large workgroups win for any m
+        if (ctx->device->architecture == vk_device_architecture::INTEL_XE2 && k >= 1024 &&
+            (a_type == GGML_TYPE_IQ4_XS || a_type == GGML_TYPE_IQ4_NL)) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
+        }
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
-            dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+            // Xe2: few rows give too few subgroup-sized workgroups to fill the GPU
+            const bool small_m = ctx->device->architecture == vk_device_architecture::INTEL_XE2 && m <= 512 && k >= 1024;
+            dmmv_wg = small_m ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
         }
+    }
+
+    // TEST ONLY: GGML_VK_DMMV_WG=large|subgroup forces the mat-vec workgroup size (DMMV and MMVQ)
+    if (const char * wg = getenv("GGML_VK_DMMV_WG")) {
+        const uint32_t max_m = getenv("GGML_VK_DMMV_WG_MAX_M") ? (uint32_t) atoi(getenv("GGML_VK_DMMV_WG_MAX_M")) : UINT32_MAX;
+        if (m <= max_m) {
+            dmmv_wg = strcmp(wg, "large") == 0 ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
+        }
+    }
+
+    if (b_type == GGML_TYPE_Q8_1) {
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
     }
 
@@ -8338,12 +8356,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // TEST ONLY: GGML_VK_FA_SPLITK_MUL=n multiplies split_k (more workgroups for decode)
+    if (const char * mul = getenv("GGML_VK_FA_SPLITK_MUL")) {
+        if (split_k > 1) {
+            split_k *= (uint32_t) std::max(1, atoi(mul));
+        }
+    }
+
     if (!use_sparse && split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
-        xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
+        xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !getenv("GGML_VK_DISABLE_XE_FA");
         if (xe_fa_opt) {
             const uint32_t split_p_size = 32;
             const size_t max_dim = (nek1 + split_p_size - 1) / split_p_size;
