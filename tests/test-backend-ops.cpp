@@ -12011,6 +12011,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_mul_mat_pair(2048,   1, 256)); // qwen35moe: shared-expert gate + router
     test_cases.emplace_back(new test_mul_mat_pair(2048, 256,   1));
+    test_cases.emplace_back(new test_mul_mat_pair(2048,  32,  32)); // qwen35 GDN: ssm_beta + ssm_alpha
     test_cases.emplace_back(new test_mul_mat_pair(4096,  32,  64));
     test_cases.emplace_back(new test_mul_mat_pair(  64,   1,   1));
     test_cases.emplace_back(new test_mul_mat_pair( 100,   3,   5)); // k not a multiple of the workgroup size
