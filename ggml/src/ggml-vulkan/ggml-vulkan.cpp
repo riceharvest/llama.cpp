@@ -4909,9 +4909,13 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
+        // add+rms_norm partials fusion stays off on Intel in general, except Xe2 on Mesa (ANV):
+        // tested on Arc Pro B70 with Mesa, test-backend-ops ADD_RMS_NORM and RMS_NORM_MUL_ADD pass.
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
-                                 device->vendor_id != VK_VENDOR_ID_INTEL;
+                                 (device->vendor_id != VK_VENDOR_ID_INTEL ||
+                                  (device->architecture == vk_device_architecture::INTEL_XE2 &&
+                                   device->driver_id == vk::DriverId::eIntelOpenSourceMESA));
         device->partials_binding_alignment =
             std::max(4u, (uint32_t)device->properties.limits.minStorageBufferOffsetAlignment);
 
