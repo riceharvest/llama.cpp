@@ -15,7 +15,13 @@ This branch only holds documentation. The code is in the branches below. Each on
 | [`sycl-qwen35moe-fusions`](https://github.com/riceharvest/llama.cpp/tree/sycl-qwen35moe-fusions) | `1c7351082` | **SYCL**: port of the b70-optimization-lab qwen35moe decode fusions (10 env flags, default off) | 35B-A3B decode 93.4 → 107.9 t/s (+15.5%), greedy identical | [qwen35moe fusions](branches/sycl-qwen35moe-fusions.md) |
 | [`sycl-mmid-small-batch`](https://github.com/riceharvest/llama.cpp/tree/sycl-mmid-small-batch) | `4f29be7b3` | **SYCL**: fused MUL_MAT_ID GEMV for 2-8 tokens (speculative-decoding verify) | 35B-A3B MTP n=3 80.9 → 131.8 t/s; correctness items open | [MoE verify](branches/sycl-mmid-small-batch.md) |
 | [`sycl-fa-xe2-occupancy`](https://github.com/riceharvest/llama.cpp/tree/sycl-fa-xe2-occupancy) | `7a1e2953a` | **SYCL**: flash-attention KV split sized from Xe2 occupancy, and GQA-6 padding in the tile kernel (knob) | not run yet | [FA occupancy](branches/sycl-fa-xe2-occupancy.md) |
+| [`vk-xe-fa-ph1-chunks`](https://github.com/riceharvest/llama.cpp/tree/vk-xe-fa-ph1-chunks) | `11a8d5d03` | Intel `xe_fa` decode phase 1: several KV chunks per workgroup so loads overlap compute (on `vk-b70-stack`; env knob, default = old kernel) | not run yet | (commit message) |
+| [`sycl-b70-stack`](https://github.com/riceharvest/llama.cpp/tree/sycl-b70-stack) / [`sycl-b70-release`](https://github.com/riceharvest/llama.cpp/tree/sycl-b70-release) | `112c30711` / `354dfa342` | **SYCL**: the qwen35moe fusions + MoE small-batch + FA occupancy together; `-release` has no test knobs and the fusions default-on | being tested | (commit messages) |
 | [`vk-fa-cm1-m8-testknobs`](https://github.com/riceharvest/llama.cpp/tree/vk-fa-cm1-m8-testknobs) | `499668eaa` | the same work with environment knobs for A/B tests; never for upstream | (test branch) | [test knobs](branches/vk-fa-cm1-m8-testknobs.md) |
+
+**Mesa 26.2.5** (measured 2026-10-15, same builds): Mesa alone more than doubles Vulkan master MoE decode (Qwen3.6-35B-A3B 39
+→ 86 tok/s) and takes the 27B from 13.2 to 22.9. `vk-b70-stack` on Mesa 26: 35B-A3B 87.3, 27B 25.3 (SYCL 21.9), 27B after 32K
+19.2; at 32K flash attention is 7.8 ms per token (14%). Short prompts are ~10% slower on Mesa 26 for both builds.
 
 Old heads are kept as tags: `archive/vk-mmvq-u32-loads-5bf369db4` (had the results file in the tree),
 `archive/vk-fa-cm1-m8-17114e63a` (same tree, old commit message).
