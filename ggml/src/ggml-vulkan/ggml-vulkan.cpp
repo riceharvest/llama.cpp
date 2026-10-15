@@ -1227,7 +1227,8 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     const uint32_t D = hsk | hsv;
 
-    const bool reduce_block_rows = D & 8 || n_kv < 1024 || device->vendor_id == VK_VENDOR_ID_INTEL;
+    // Intel: smaller tiles for prefill only; keep 16-row tiles for GQA decode (n_rows <= 16)
+    const bool reduce_block_rows = D & 8 || n_kv < 1024 || (device->vendor_id == VK_VENDOR_ID_INTEL && n_rows > 16);
 
     if (n_rows == 1) {
         result.block_rows = 1;
@@ -8152,7 +8153,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+    const uint32_t gqa_probe_rows = ctx->device->vendor_id == VK_VENDOR_ID_INTEL ? 16 : 512;
+    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, gqa_probe_rows, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
