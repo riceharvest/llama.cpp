@@ -692,8 +692,8 @@ class NemotronHModel(GraniteHybridModel):
                 return
 
             if name.find("mixer.experts") != -1:
-                n_experts = self.hparams["n_routed_experts"]
                 assert bid is not None
+                n_experts = self._n_routed_experts(bid)
 
                 if self._experts is None:
                     self._experts = [{} for _ in range(self.block_count)]
@@ -720,6 +720,9 @@ class NemotronHModel(GraniteHybridModel):
 
         yield from super().modify_tensors(data_torch, name, bid)
 
+    def _n_routed_experts(self, bid: int) -> int:
+        return self.hparams["n_routed_experts"]
+
     def prepare_tensors(self):
         super().prepare_tensors()
 
@@ -745,6 +748,15 @@ class NemotronHPuzzleModel(NemotronHModel):
 
     def __init__(self, dir_model: "Path", *args, **kwargs):
         hparams = dict(kwargs.pop("hparams", None) or ModelBase.load_hparams(dir_model, self.is_mistral_format))
+        # Omni checkpoints (NemotronH_Omni_Reasoning_V3, e.g. Nemotron 3.5 Bolt) keep the Puzzle config in llm_config
+        # (loaded as text_config); move it to the root before reading block_configs
+        if "text_config" in hparams:
+            hparams = {**hparams, **hparams["text_config"]}
+        # NemotronH's hidden_act is the MLP activation (relu2, hard-coded in the graph); the SSM uses mamba_hidden_act.
+        # GraniteHybridModel checks hidden_act as the SSM activation, so drop it when it only describes the MLP.
+        if hparams.get("mamba_hidden_act", "silu") == "silu" and hparams.get("hidden_act") not in (None, "silu"):
+            hparams.pop("hidden_act")
+            hparams.get("text_config", {}).pop("hidden_act", None)  # TextModel merges text_config into the root again
 
         self.block_configs: list[dict] = hparams["block_configs"]
         self.n_layer_trunk = len(self.block_configs)
@@ -787,7 +799,10 @@ class NemotronHPuzzleModel(NemotronHModel):
         self.gguf_writer.add_expert_used_count(experts_used)
 
         self.gguf_writer.add_expert_shared_feed_forward_length(self.hparams["moe_shared_expert_intermediate_size"])
-        self.gguf_writer.add_expert_count(self.hparams["n_routed_experts"])
+        # the largest per-block expert count bounds every layer (the loader reads each layer's count from its router);
+        # some Puzzle configs (Bolt) carry no global n_routed_experts, only num_experts = 512
+        n_routed = max(bc.get("n_routed_experts") or 0 for bc in self.block_configs) or self.hparams["n_routed_experts"]
+        self.gguf_writer.add_expert_count(n_routed)
         self.gguf_writer.add_expert_shared_count(self.hparams["n_shared_experts"])
         self.gguf_writer.add_expert_weights_norm(self.hparams["norm_topk_prob"])
         self.gguf_writer.add_expert_weights_scale(self.hparams["routed_scaling_factor"])
@@ -806,6 +821,10 @@ class NemotronHPuzzleModel(NemotronHModel):
             name = name[: -len("e_score_correction_bias")] + "e_score_correction.bias"
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def _n_routed_experts(self, bid: int) -> int:
+        # Puzzle blocks have their own expert count (Bolt: 240-496 per MoE block)
+        return self.block_configs[bid].get("n_routed_experts") or self.hparams["n_routed_experts"]
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
