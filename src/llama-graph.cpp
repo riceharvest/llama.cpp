@@ -3779,7 +3779,12 @@ ggml_tensor * llm_graph_context::build_rs(
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    if (states->type == GGML_TYPE_F32) {
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    } else {
+        // SCALE is F32-only on most backends: zero through an F32 copy of the row
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_scale(ctx0, ggml_cast(ctx0, state_zero, GGML_TYPE_F32), 0), state_zero));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

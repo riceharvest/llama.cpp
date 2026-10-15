@@ -4,9 +4,10 @@
 #include "ggml.h"
 #include "gated_delta_net.hpp"
 #include <cmath>
+#include <type_traits>
 
 
-template <int S_v, bool KDA, bool keep_rs_t>
+template <int S_v, bool KDA, bool keep_rs_t, typename StateT>
 void gated_delta_net_sycl(const float *     q,
                           const float *     k,
                           const float *     v,
@@ -14,7 +15,7 @@ void gated_delta_net_sycl(const float *     q,
                           const float *     beta,
                           const float *     curr_state,
                           float *           dst,
-                          float *           state,
+                          StateT *          state,
                           int64_t           H,
                           int64_t           n_tokens,
                           int64_t           sq1,
@@ -143,11 +144,11 @@ void gated_delta_net_sycl(const float *     q,
         if constexpr (keep_rs_t) {
             const int target_slot = (int) n_tokens - 1 - t;
             if (target_slot >= 0 && target_slot < K) {
-                float * curr_state = state + target_slot * state_slot_stride;
+                StateT * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
                     const int i = r * warp_size + lane;
-                    curr_state[col * S_v + i] = s_shard[r];
+                    curr_state[col * S_v + i] = (StateT) s_shard[r];
                 }
             }
         }
@@ -157,12 +158,12 @@ void gated_delta_net_sycl(const float *     q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i          = r * warp_size + lane;
-            state[col * S_v + i] = s_shard[r];
+            state[col * S_v + i] = (StateT) s_shard[r];
         }
     }
 }
 
-template <bool KDA, bool keep_rs_t>
+template <bool KDA, bool keep_rs_t, typename StateT>
 static void launch_gated_delta_net(const float *   q_d,
                                    const float *   k_d,
                                    const float *   v_d,
@@ -170,7 +171,7 @@ static void launch_gated_delta_net(const float *   q_d,
                                    const float *   b_d,
                                    const float *   s_d,
                                    float *         dst_d,
-                                   float *         state_d,
+                                   StateT *        state_d,
                                    int64_t         S_v,
                                    int64_t         H,
                                    int64_t         n_tokens,
@@ -206,7 +207,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 16;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                                         gated_delta_net_sycl<sv, KDA, keep_rs_t, StateT>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                                                                        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
                                                                        sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                      });
@@ -217,7 +218,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 32;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                                         gated_delta_net_sycl<sv, KDA, keep_rs_t, StateT>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                                                                        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
                                                                        sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                      });
@@ -228,7 +229,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 64;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
+                                            gated_delta_net_sycl<sv, KDA, keep_rs_t, StateT>(
                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
                                                 sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                         });
@@ -240,7 +241,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 128;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
+                                            gated_delta_net_sycl<sv, KDA, keep_rs_t, StateT>(
                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
                                                 sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                         });
@@ -327,26 +328,35 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
         state_slot_stride = cache->slot_stride;
     }
 
-    if (kda) {
-        if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+    auto launch = [&](auto * state_ptr) {
+        using StateT = std::remove_pointer_t<decltype(state_ptr)>;
+        if (kda) {
+            if (keep_rs) {
+                launch_gated_delta_net<true, true, StateT>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_ptr,
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            } else {
+                launch_gated_delta_net<true, false, StateT>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_ptr,
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            }
         } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            if (keep_rs) {
+                launch_gated_delta_net<false, true, StateT>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_ptr,
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            } else {
+                launch_gated_delta_net<false, false, StateT>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_ptr,
+                    S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            }
         }
+    };
+    // an F16 state cache is written directly as F16 (the attention scores in dst stay F32)
+    if (cache != nullptr && cache->f16) {
+        launch(reinterpret_cast<sycl::half *>(cache->data));
     } else {
-        if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        }
+        launch(state_d);
     }
 }
 

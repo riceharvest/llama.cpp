@@ -2463,6 +2463,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"-cts", "--cache-type-s"}, "TYPE",
+        string_format(
+            "recurrent (linear-attention) state type for GDN models (Qwen3-Next, Qwen3.5/3.6): f32 or f16;\n"
+            "f16 halves the per-sequence state, which matters with many parallel sequences\n"
+            "(default: %s)",
+            ggml_type_name(params.cache_type_s)
+        ),
+        [](common_params & params, const std::string & value) {
+            if (value == "f32") {
+                params.cache_type_s = GGML_TYPE_F32;
+            } else if (value == "f16") {
+                params.cache_type_s = GGML_TYPE_F16;
+            } else {
+                throw std::invalid_argument("invalid --cache-type-s: " + value + " (f32 or f16)");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_S"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

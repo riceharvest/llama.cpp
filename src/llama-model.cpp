@@ -2752,6 +2752,19 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    // recurrent (linear-attention) state type: GDN models only read it with GET_ROWS (to F32) and write it with CPY, so F16
+    // works there; other recurrent models (Mamba, RWKV, ...) read the state directly in their kernels and keep F32
+    ggml_type type_s = GGML_TYPE_F32;
+    if (params.type_s != GGML_TYPE_F32) {
+        if ((arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) && params.type_s == GGML_TYPE_F16) {
+            type_s = GGML_TYPE_F16;
+            LLAMA_LOG_INFO("%s: recurrent state in %s\n", __func__, ggml_type_name(type_s));
+        } else {
+            LLAMA_LOG_WARN("%s: recurrent state type %s is not supported for %s, using f32\n", __func__,
+                    ggml_type_name(params.type_s), llm_arch_name(arch));
+        }
+    }
+
     llama_memory_i * res;
 
     // the non-causal LFM2 decision graph reads the whole prompt in one batch, nothing is kept
@@ -2890,7 +2903,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* attn_n_swa        */ hparams.n_swa,
                     /* attn_swa_type     */ hparams.swa_type,
                     /* recurrent_type_r  */ GGML_TYPE_F32,
-                    /* recurrent_type_s  */ GGML_TYPE_F32,
+                    /* recurrent_type_s  */ type_s,
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3141,7 +3154,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ type_s,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3161,7 +3174,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3181,7 +3194,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

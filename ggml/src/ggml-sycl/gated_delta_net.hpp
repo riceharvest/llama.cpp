@@ -7,8 +7,9 @@
 
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
 struct ggml_sycl_gated_delta_net_fused_cache {
-    float * data;        // rollback slot 0
+    float * data;        // rollback slot 0 (points to sycl::half when f16)
     int64_t slot_stride; // between rollback slots (0 when K==1)
+    bool    f16 = false; // the cache holds the state in F16 (llama_context_params::type_s)
 };
 
 void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
