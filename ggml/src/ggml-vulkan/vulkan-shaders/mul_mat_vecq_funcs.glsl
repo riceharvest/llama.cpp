@@ -84,12 +84,19 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const vec2 dma, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_Q5_0)
-// 2-byte loads for Q5_0 blocks (22 bytes)
+// Q5_0 blocks are 22 bytes, so qh/qs are only 2-byte aligned. Read them with 32-bit loads.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
+uint32_t load_a_4b(const uint byte_offset) {
+    const uint w = byte_offset / 4;
+    if ((byte_offset & 2) == 0) {
+        return data_a_u32[w];
+    }
+    return (data_a_u32[w] >> 16) | (data_a_u32[w + 1] << 16);
+}
+
 i32vec2 repack(uint ib, uint iqs) {
-    const u16vec2 quants = u16vec2(data_a_packed16[ib].qs[iqs * 2    ],
-                                   data_a_packed16[ib].qs[iqs * 2 + 1]);
-    const uint32_t vui = pack32(quants);
-    const int32_t qh = int32_t((uint32_t(data_a_packed16[ib].qh[1]) << 16 | data_a_packed16[ib].qh[0]) >> (4 * iqs));
+    const uint32_t vui = load_a_4b(ib * 22 + 6 + iqs * 4);
+    const int32_t qh = int32_t(load_a_4b(ib * 22 + 2) >> (4 * iqs));
     const int32_t v0 = int32_t(vui & 0x0F0F0F0F)
                      | ((qh & 0xF) * 0x02040810) & 0x10101010; // (0,1,2,3) -> (4,12,20,28)
 
@@ -126,10 +133,15 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const vec2 dma, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_Q8_0)
-// 2-byte loads for Q8_0 blocks (34 bytes)
+// Q8_0 blocks are 34 bytes, so qs is only 2-byte aligned. Read it with 32-bit loads.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
 int32_t repack(uint ib, uint iqs) {
-    return pack32(i16vec2(data_a_packed16[ib].qs[iqs * 2    ],
-                          data_a_packed16[ib].qs[iqs * 2 + 1]));
+    const uint byte_offset = ib * 34 + 2 + iqs * 4;
+    const uint w = byte_offset / 4;
+    if ((byte_offset & 2) == 0) {
+        return int32_t(data_a_u32[w]);
+    }
+    return int32_t((data_a_u32[w] >> 16) | (data_a_u32[w + 1] << 16));
 }
 
 FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
@@ -138,12 +150,13 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_MXFP4)
-// 1-byte loads for mxfp4 blocks (17 bytes)
+// mxfp4 blocks are 17 bytes, so qs has any byte alignment. Read it with 32-bit loads.
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
 i32vec2 repack(uint ib, uint iqs) {
-    const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
-                                      data_a[ib].qs[iqs * 4 + 1],
-                                      data_a[ib].qs[iqs * 4 + 2],
-                                      data_a[ib].qs[iqs * 4 + 3]));
+    const uint byte_offset = ib * 17 + 1 + iqs * 4;
+    const uint w = byte_offset / 4;
+    const uint shift = (byte_offset & 3) * 8;
+    const uint32_t qs = shift == 0 ? data_a_u32[w] : (data_a_u32[w] >> shift) | (data_a_u32[w + 1] << (32 - shift));
 
     const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
     const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
@@ -239,8 +252,21 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K)
+// Q3_K (110 bytes) and Q6_K (210 bytes) blocks are only 2-byte aligned. Read 16 bytes with 32-bit loads,
+// 16-bit loads are slow on some drivers (Mesa on Intel Xe2).
+layout (binding = 0) readonly buffer A_U32 {uint32_t data_a_u32[];};
+uvec4 load_a_16b(const uint byte_offset) {
+    const uint w = byte_offset / 4;
+    if ((byte_offset & 2) == 0) {
+        return uvec4(data_a_u32[w], data_a_u32[w + 1], data_a_u32[w + 2], data_a_u32[w + 3]);
+    }
+    const uint w0 = data_a_u32[w], w1 = data_a_u32[w + 1], w2 = data_a_u32[w + 2], w3 = data_a_u32[w + 3], w4 = data_a_u32[w + 4];
+    return uvec4((w0 >> 16) | (w1 << 16), (w1 >> 16) | (w2 << 16), (w2 >> 16) | (w3 << 16), (w3 >> 16) | (w4 << 16));
+}
+#endif
+
 #if defined(DATA_A_Q3_K)
-// 2-byte loads for Q3_K blocks (110 bytes)
 i32vec4 repack4(uint ib, uint iqs) {
     const uint ib_k = ib / 8;
     const uint iqs_k = (ib % 8) * 8 + iqs;
@@ -249,23 +275,9 @@ i32vec4 repack4(uint ib, uint iqs) {
     const uint qs_shift = ((iqs_k % 32) / 8) * 2;
     const uint hm_shift = iqs_k / 8;
 
-    const uvec4 qs = uvec4( uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2    ]) |
-                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 1]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 2]) |
-                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 3]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 4]) |
-                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 5]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 6]) |
-                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 7]) << 16));
-
-    const uvec4 hmask = uvec4( uint32_t(data_a_packed16[ib_k].hmask[iqs * 2    ]) |
-                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 1]) << 16),
-                               uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 2]) |
-                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 3]) << 16),
-                               uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 4]) |
-                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 5]) << 16),
-                               uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 6]) |
-                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 7]) << 16));
+    const uint block_byte = ib_k * 110;
+    const uvec4 qs = load_a_16b(block_byte + 32 + qs_idx * 4);
+    const uvec4 hmask = load_a_16b(block_byte + iqs * 4);
 
     // bitwise OR to add 4 if hmask is set, subtract later
     const uint vals0 = ((    qs.x >> qs_shift) & 0x03030303) |
@@ -381,7 +393,6 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 #endif
 
 #if defined(DATA_A_Q6_K)
-// 2-byte loads for Q6_K blocks (210 bytes)
 i32vec4 repack4(uint ib, uint iqs) {
     const uint ib_k = ib / 8;
     const uint iqs_k = (ib % 8) * 8 + iqs;
@@ -392,23 +403,9 @@ i32vec4 repack4(uint ib, uint iqs) {
     const uint qh_idx = (iqs_k / 32) * 8 + iqs;
     const uint qh_shift = ((iqs_k % 32) / 8) * 2;
 
-    const uvec4 ql = uvec4( uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2    ]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 1]) << 16),
-                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 2]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 3]) << 16),
-                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 4]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 5]) << 16),
-                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 6]) |
-                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 7]) << 16));
-
-    const uvec4 qh = uvec4( uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2    ]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 1]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 2]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 3]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 4]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 5]) << 16),
-                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 6]) |
-                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 7]) << 16));
+    const uint block_byte = ib_k * 210;
+    const uvec4 ql = load_a_16b(block_byte + ql_idx * 4);
+    const uvec4 qh = load_a_16b(block_byte + 128 + qh_idx * 4);
 
     const uint vals0 = (( ql.x >> ql_shift) & 0x0F0F0F0F) |
                        (((qh.x >> qh_shift) & 0x03030303) << 4);
