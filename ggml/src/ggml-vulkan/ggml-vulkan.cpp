@@ -6674,6 +6674,16 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return false;
     }
 
+    // Xe2 + Mesa: q3_K/q6_K/iq4_xs at 2-4 columns (MTP verify, parallel slots) run faster on DMMV;
+    // Arc Pro B70, Mesa 26.2.5, batched decode B=2/4: Qwen3.8-27B Q4_K_M +9/+11%, UD-IQ4_XS +17/+4%.
+    // Not q4_0 (DMMV batches are 10-21% slower there) and not above 4 columns (iq4_xs DMMV at 8: -40%).
+    if (n > 1 && n <= 4 && device->vendor_id == VK_VENDOR_ID_INTEL &&
+        device->architecture == vk_device_architecture::INTEL_XE2 &&
+        device->driver_id == vk::DriverId::eIntelOpenSourceMESA &&
+        (src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K || src0_type == GGML_TYPE_IQ4_XS)) {
+        return false;
+    }
+
     // MMVQ is generally good for batches
     if (n > 1) {
         return true;
