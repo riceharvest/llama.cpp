@@ -20,6 +20,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 
+#define FA_O_USE_ACC_TYPE
 #include "types.glsl"
 #include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
@@ -45,7 +46,7 @@ layout (binding = 3) readonly buffer M {float16_t data_m[];};
 // If SubGroupSize is set to 0 then only use shmem reductions
 const uint32_t tmpsh_size = (SubGroupSize > 0) ? (row_split == 1 ? num_subgroups * D_split : num_subgroups) : WorkGroupSize;
 shared float tmpsh[tmpsh_size];
-shared FLOAT_TYPEV4 tmpshv4[tmpsh_size];
+shared O_TYPEV4 tmpshv4[tmpsh_size];
 
 const uint32_t masksh_stride = Br + 1;
 shared FLOAT_TYPE masksh[Bc * masksh_stride];
@@ -145,10 +146,10 @@ void main() {
     }
     barrier();
 
-    FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
+    O_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Of[r][d] = FLOAT_TYPEV4(0.0);
+            Of[r][d] = O_TYPEV4(0.0);
         }
     }
 
@@ -482,7 +483,7 @@ void main() {
 
         [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Of[r][d] = FLOAT_TYPE(eMf[r]) * Of[r][d];
+                Of[r][d] = O_TYPE(eMf[r]) * Of[r][d];
             }
         }
 
@@ -518,9 +519,9 @@ void main() {
                 continue;
             }
 
-            FLOAT_TYPE Pf[rows_per_thread];
+            O_TYPE Pf[rows_per_thread];
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
+                Pf[r] = O_TYPE(exp(float(Sf[r][c]) - Mf[r]));
                 Lf[r] += Pf[r];
             }
 
@@ -537,7 +538,7 @@ void main() {
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + vcol * v_stride / 4 + d * D_split + d_tid]);
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+                    Of[r][d] += Pf[r] * O_TYPEV4(Vf);
                 }
             }
         }
@@ -620,7 +621,7 @@ void main() {
         }
 
         [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-            Of[r][d] = FLOAT_TYPE(eMf) * Of[r][d];
+            Of[r][d] = O_TYPE(eMf) * Of[r][d];
 
             if (SubGroupSize > 0) {
                 [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
@@ -630,7 +631,7 @@ void main() {
                         // Something about f16vec4 subgroupShuffleXor is broken on AMD Windows RDNA2 and below.
                         // Shuffle full vec4 as workaround.
                         // See https://github.com/ggml-org/llama.cpp/issues/19881#issuecomment-3958643697
-                        Of[r][d] += FLOAT_TYPEV4(subgroupShuffleXor(vec4(Of[r][d]), s));
+                        Of[r][d] += O_TYPEV4(subgroupShuffleXor(vec4(Of[r][d]), s));
                     }
                 }
                 if (row_split == 1) {
@@ -719,7 +720,7 @@ void main() {
                 ms = exp(Mf[r] - sink);
 
                 [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                    Of[r][d] *= FLOAT_TYPE(ms);
+                    Of[r][d] *= O_TYPE(ms);
                 }
             } else {
                 vs = exp(sink - Mf[r]);
@@ -736,9 +737,10 @@ void main() {
 
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Of[r][d] *= FLOAT_TYPE(Lfrcp[r]);
-#if defined(FLOAT_TYPE_MAX)
-            Of[r][d] = clamp(Of[r][d], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+            Of[r][d] *= O_TYPE(Lfrcp[r]);
+#if defined(ACC_TYPE_MAX)
+            // only the f16acc variant accumulates O in fp16
+            Of[r][d] = clamp(Of[r][d], -ACC_TYPE_MAX, ACC_TYPE_MAX);
 #endif
         }
     }
