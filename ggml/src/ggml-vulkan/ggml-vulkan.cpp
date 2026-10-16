@@ -2388,14 +2388,41 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
 
+        // Intel coopmat1 fp16-accumulator matmuls: fold the fp16 accumulators into fp32 partial sums in D every
+        // FLUSH_K elements of K (mul_mm.comp constant_id 15), so the fp16 rounding error stops growing with K.
+        // The fp32-accumulator pipelines spill on Xe2 (8 fp32 accumulators per subgroup) and run ~3.7x slower.
+        // GGML_VK_MM_FLUSH_K=<multiple of 32> overrides the period, 0 disables.
+        // off by default: on an Arc Pro B70, 1024 gives 13-19x lower error at K=14336 for 16-19% slower prefill
+        uint32_t cm1_flush_k = 0;
+        if (const char * fk = getenv("GGML_VK_MM_FLUSH_K")) {
+            cm1_flush_k = (uint32_t)strtoul(fk, nullptr, 10) / 32 * 32;
+        }
+        auto cm1_flush_spec = [cm1_flush_k](std::vector<uint32_t> spec, bool quant) {
+            // pad to constant_id 15 with the shader defaults: SHMEM_STRIDE_PAD = 4 (id 12, quant: 13),
+            // APPLY_SLM_A_RESHAPE = false (id 13, quant: 14), id 14 is unused for non-quant shaders
+            const size_t pad_id = quant ? 13 : 12;
+            while (spec.size() < 15) {
+                spec.push_back(spec.size() == pad_id ? 4u : 0u);
+            }
+            spec.push_back(cm1_flush_k);  // constantID=15: FLUSH_K
+            return spec;
+        };
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                               const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
-            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, cm1_spec, false, true, 0, true, cm1_pin);
+            spec_fn_t fs = cm1_spec;
+            if (cm1_flush_k && key.f16acc && !key.mul_mat_id) {
+                fs = [&](const std::vector<uint32_t>& wt, bool a) { return cm1_flush_spec(ggml_vk_mul_mm_spec(wt, a), false); };
+            }
+            if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, fs, false, true, 0, true, cm1_pin);
         };
         auto cm1_create_quant = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                     const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
-            spec_fn_t qs = [&, type_a=key.type_a](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a); };
+            const bool flush = cm1_flush_k && key.f16acc && !key.mul_mat_id;
+            spec_fn_t qs = [&, type_a=key.type_a, flush](const std::vector<uint32_t>& wt, bool a) {
+                auto spec = ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a);
+                return flush ? cm1_flush_spec(spec, true) : spec;
+            };
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
             if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, qs, false, true, 0, true, cm1_pin);
         };
