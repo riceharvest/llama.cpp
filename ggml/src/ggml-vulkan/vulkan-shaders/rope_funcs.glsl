@@ -30,8 +30,15 @@ void rope_yarn(const float theta_extrap, const uint i0, out float cos_theta, out
     if (p.is_back != 0) {
         theta = -theta;
     }
-    cos_theta = cos(theta) * mscale;
-    sin_theta = sin(theta) * mscale;
+    // Reduce theta to [-pi, pi] before sin/cos: GPU sin/cos are only accurate near that
+    // range (on Intel Xe2 / Mesa ANV they return garbage for |theta| above ~1.3e5, i.e. for
+    // positions past ~128K in the high-frequency dims). Two-term 2*pi (Cody-Waite).
+    precise float theta_r = theta;
+    const float k = round(theta_r * 0.15915494309189535f);
+    theta_r = fma(-k, 6.28318548202514648f, theta_r);
+    theta_r = fma(-k, -1.7484556000744487e-07f, theta_r);
+    cos_theta = cos(theta_r) * mscale;
+    sin_theta = sin(theta_r) * mscale;
 }
 
 void rope_norm(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
