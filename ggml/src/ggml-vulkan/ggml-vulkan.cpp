@@ -6609,8 +6609,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         return false;
     }
 
-    // MMVQ is generally good for batches
-    if (n > 1) {
+    // MMVQ is generally good for batches, except on Xe2 for Q4_0 (16-bit A loads) and for IQ4_XS up to 4 columns,
+    // where DMMV measured 1.2-3.7x faster on an Arc Pro B70 (q4_0 N=2: 66 vs 243 us; iq4_xs N=2: 80 vs 143 us)
+    const bool xe2_dmmv_batch = device->vendor_id == VK_VENDOR_ID_INTEL &&
+        device->architecture == vk_device_architecture::INTEL_XE2 &&
+        (src0_type == GGML_TYPE_Q4_0 ||
+         ((src0_type == GGML_TYPE_IQ4_XS || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) && n <= 4));
+    if (n > 1 && !xe2_dmmv_batch) {
         return true;
     }
 
@@ -6645,8 +6650,14 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
     case VK_VENDOR_ID_INTEL:
         if (device->architecture == vk_device_architecture::INTEL_XE2) {
-            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+            if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K) {
                 return true;
+            }
+            // single-token q3_K / q6_K: on Mesa ANV (Arc Pro B70, Mesa 26.2) the DMMV shader is faster
+            // than MMVQ (q3_K 6.2x, q6_K 1.4-1.6x, e.g. 248320x4096 output head 5.99 vs 9.36 ms);
+            // batches still use MMVQ above
+            if (src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
+                return device->driver_id != vk::DriverId::eIntelOpenSourceMESA;
             }
         }
 
@@ -6666,6 +6677,8 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_IQ4_XS:
+        // Arc Pro B70 (Mesa): single-token iq1_m DMMV 64.0 vs MMVQ 85.7 us
+        case GGML_TYPE_IQ1_M:
             return false;
         default:
             return true;
