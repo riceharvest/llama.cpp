@@ -2960,26 +2960,43 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    const auto apply_one = [ctx](llama_token_data & td, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (td.logit <= 0) {
+            td.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            td.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // fast path: when the candidates are still indexed by token id (penalties usually run first, on the full
+    // vocab), touch only the <= penalty_last_n penalized tokens instead of one hash lookup per vocab entry
+    bool indexed = !cur_p->sorted;
+    for (const auto & [tok, cnt] : ctx->token_count) {
+        if (!indexed) {
+            break;
+        }
+        indexed = tok >= 0 && (size_t) tok < cur_p->size && cur_p->data[tok].id == tok;
+    }
+
+    if (indexed) {
+        for (const auto & [tok, cnt] : ctx->token_count) {
+            apply_one(cur_p->data[tok], cnt);
+        }
+    } else {
+        // Apply frequency and presence penalties to the cur_p
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+            apply_one(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
