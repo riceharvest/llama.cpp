@@ -6,10 +6,13 @@
 // i = 1..n-1, space-separated (the first token has no prediction). argmax.txt (optional, needle mode): 1 where t_i is
 // the argmax; in needle mode only the last 64 positions are scored (answers sit at the end; full-vocab softmax per
 // position on the CPU is otherwise the bottleneck at 100k+ tokens).
+// TINYKV_CACHE_TYPE=f16|q8_0|q4_0 (env) sets the K and V cache type (default f16).
 
 #include "llama.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -58,6 +61,12 @@ int main(int argc, char ** argv) {
     cp.n_batch         = n_batch;
     cp.n_ubatch        = std::min(n_batch, 512);
     cp.flash_attn_type = fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    if (const char * ct = std::getenv("TINYKV_CACHE_TYPE")) {
+        const ggml_type t = !strcmp(ct, "q8_0") ? GGML_TYPE_Q8_0 : !strcmp(ct, "q4_0") ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
+        cp.type_k = t;
+        cp.type_v = t;
+        fprintf(stderr, "cache type %s\n", ggml_type_name(t));
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         return 1;
