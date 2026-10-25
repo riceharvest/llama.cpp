@@ -1,4 +1,5 @@
 #include "models.h"
+#include "tinykv.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -21,6 +22,8 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
     }
+
+    tinykv_load_hparams(ml, hparams);
 
     switch (hparams.n_layer()) {
         case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
@@ -67,7 +70,22 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, flags);
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
 
-        if (!hparams.is_recr(il)) {
+        if (!hparams.is_recr(il) && hparams.tinykv && hparams.tinykv_owner[il] >= 0) {
+            // tinykv attention layer (see tinykv.h): reusers have no k/v of their own
+            const int64_t dk = hparams.tinykv_k_dim[il], dv = hparams.tinykv_v_dim[il];
+            if (hparams.tinykv_owner[il] == il) {
+                create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+                layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+                layer.attn_tk_k   = create_tensor(tn(LLM_TENSOR_ATTN_TK_K, "weight", il), { n_embd_k_gqa, dk * n_head_kv }, flags);
+                layer.attn_tk_v   = create_tensor(tn(LLM_TENSOR_ATTN_TK_V, "weight", il), { n_embd_v_gqa, dv * n_head_kv }, flags);
+            } else {
+                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", il), { n_embd, n_embd_head_k * n_head * 2 }, flags);
+            }
+            layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
+            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
+            layer.attn_tk_q   = create_tensor(tn(LLM_TENSOR_ATTN_TK_Q,   "weight", il), { n_embd_head_k, dk, n_head_kv }, flags);
+            layer.attn_tk_d   = create_tensor(tn(LLM_TENSOR_ATTN_TK_D,   "weight", il), { dv, n_embd_head_k, n_head_kv }, flags);
+        } else if (!hparams.is_recr(il)) {
             // Attention layers
             create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
@@ -172,7 +190,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            cur = hparams.tinykv && hparams.tinykv_owner[il] >= 0
+                ? tinykv_build_attn(*this, model.layers[il], inp->get_attn(), cur, inp_pos, sections, il)
+                : build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {

@@ -3233,12 +3233,15 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    // k_cur/v_cur == nullptr: the layer reads a cache another layer wrote (tinykv layer sharing)
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+        if (k_cur) {
+            k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+        }
     }
 
-    if (inp->self_v_rot) {
+    if (inp->self_v_rot && v_cur) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
@@ -3246,8 +3249,12 @@ ggml_tensor * llm_graph_context::build_attn(
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
-    ggml_build_forward_expand(gf, v_cur);
-    ggml_build_forward_expand(gf, k_cur);
+    if (v_cur) {
+        ggml_build_forward_expand(gf, v_cur);
+    }
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
+    }
 
     const auto * mctx_cur = inp->mctx;
 
@@ -3255,13 +3262,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k;
     ggml_tensor * v;
 
-    if (cparams.training) {
+    if (cparams.training && k_cur && v_cur) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
 
         k = k_cur;
         v = v_cur;
     } else {
-        {
+        if (k_cur && v_cur) {
             const auto & k_idxs = inp->get_k_idxs();
             const auto & v_idxs = inp->get_v_idxs();
 

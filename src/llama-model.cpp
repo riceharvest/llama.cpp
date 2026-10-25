@@ -1462,6 +1462,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.rope_pattern.begin(),  hparams.rope_pattern.end(), 1);
     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
+    std::fill(hparams.tinykv_owner.begin(), hparams.tinykv_owner.end(), -1);
+    std::fill(hparams.tinykv_k_dim.begin(), hparams.tinykv_k_dim.end(), 0);
+    std::fill(hparams.tinykv_v_dim.begin(), hparams.tinykv_v_dim.end(), 0);
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
@@ -3230,7 +3233,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* reuse_attn        */ hparams.tinykv ?
+                                llama_memory_i::layer_reuse_cb([&](uint32_t il) { return hparams.tinykv_reuse(il); }) : nullptr);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

@@ -340,6 +340,8 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize Mamba/Kimi's small conv1d weights
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ssm_conv1d") == std::string::npos;
+    // tinykv cache maps: tiny, and the compressed cache's precision rests on them
+    quantize &= name.find("attn_tk_") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
     // do not quantize MiniMax's indexer projection weights, they are tiny

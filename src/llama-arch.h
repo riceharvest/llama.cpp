@@ -328,6 +328,9 @@ enum llm_kv {
     LLM_KV_ATTENTION_COMPRESS_RATIOS,
     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
     LLM_KV_ATTENTION_RECURRENT_LAYERS,
+    LLM_KV_TINYKV_OWNERS,
+    LLM_KV_TINYKV_K_DIMS,
+    LLM_KV_TINYKV_V_DIMS,
 
     LLM_KV_HYPER_CONNECTION_COUNT,
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
@@ -522,6 +525,10 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_ROT_EMBD,
     LLM_TENSOR_ATTN_SINKS,
     LLM_TENSOR_ATTN_GATE,
+    LLM_TENSOR_ATTN_TK_Q, // tinykv: query map into the compressed key space
+    LLM_TENSOR_ATTN_TK_K, // tinykv: key compression (cache owners)
+    LLM_TENSOR_ATTN_TK_V, // tinykv: value compression (cache owners)
+    LLM_TENSOR_ATTN_TK_D, // tinykv: attention output decompression
     LLM_TENSOR_ATTN_RESID_ALPHA,
     LLM_TENSOR_ATTN_RESID_BETA,
     LLM_TENSOR_FFN_GATE_INP,

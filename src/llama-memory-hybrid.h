@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* attention layers that read another layer's KV cache (tinykv) */
+    const layer_reuse_cb  & reuse_attn  = nullptr);
 
     ~llama_memory_hybrid() = default;
 

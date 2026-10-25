@@ -138,6 +138,9 @@ uint32_t llama_hparams::n_embd_out() const {
 }
 
 uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
+    if (tinykv && il < n_layer_all && tinykv_k_dim[il] > 0) {
+        return tinykv_k_dim[il];
+    }
     if (il < n_layer_all) {
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
     }
@@ -146,11 +149,21 @@ uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_embd_head_v(uint32_t il) const {
+    if (tinykv && il < n_layer_all && tinykv_v_dim[il] > 0) {
+        return tinykv_v_dim[il];
+    }
     if (il < n_layer_all) {
         return is_swa(il) ? n_embd_head_v_swa : n_embd_head_v_full;
     }
 
     GGML_ABORT("fatal error");
+}
+
+int32_t llama_hparams::tinykv_reuse(uint32_t il) const {
+    if (!tinykv || il >= n_layer() || tinykv_owner[il] < 0 || tinykv_owner[il] == (int32_t) il) {
+        return -1;
+    }
+    return tinykv_owner[il];
 }
 
 uint32_t llama_hparams::n_embd_k_gqa(uint32_t il) const {
@@ -324,6 +337,11 @@ bool llama_hparams::has_kv(uint32_t il) const {
             return true;
         }
 
+        return false;
+    }
+
+    // tinykv: a layer that reads another layer's cache has none of its own
+    if (tinykv_reuse(il) >= 0) {
         return false;
     }
 

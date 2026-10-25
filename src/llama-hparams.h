@@ -200,6 +200,16 @@ struct llama_hparams {
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
 
+    // tinykv: full-attention layers that read another layer's KV cache, with a per-layer cache head size
+    // (owner[il] = the layer whose cache il reads, il itself for an owner, -1 = not a tinykv layer)
+    bool tinykv = false;
+    std::array<int32_t,  LLAMA_MAX_LAYERS> tinykv_owner;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> tinykv_k_dim; // cache head size of keys (0 = n_embd_head_k_full)
+    std::array<uint32_t, LLAMA_MAX_LAYERS> tinykv_v_dim;
+
+    // tinykv: the layer whose KV cache il reads (-1: its own / not shared)
+    int32_t tinykv_reuse(uint32_t il) const;
+
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
     uint32_t ssm_d_inner = 0;

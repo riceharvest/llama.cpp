@@ -752,6 +752,69 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
+class _TinyKVMixin:
+    # tinykv checkpoints (https://huggingface.co/darioooooo0o/Qwen3.6-35B-A3B-TinyKV): the trained copies of the
+    # full-attention tensors (self_attn.tk.<stock name>) replace the stock ones, layers that read another layer's KV
+    # cache drop their k/v projections, and tk_q/tk_k/tk_v/tk_d are the cache maps (kept in F32)
+    _TK_STOCK = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight", "q_norm.weight", "k_norm.weight")
+    _TK_REUSER_DROP = ("k_proj.weight", "v_proj.weight", "k_norm.weight")
+    _TK_MAPS = ("tk_q", "tk_k", "tk_v", "tk_d")
+
+    hparams: dict[str, Any]
+    gguf_writer: gguf.GGUFWriter
+    block_count: int
+
+    def _tk_layout(self) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+        t = self.hparams["tinykv"]
+        owners = {int(k): int(v) for k, v in t["owners"].items()}
+        assert int(t.get("cache_heads") or self.hparams["num_key_value_heads"]) == self.hparams["num_key_value_heads"]
+        k_dim = {l: int(t["k_dim"][str(o)]) for l, o in owners.items()}
+        v_dim = {l: int(t["v_dim"][str(o)]) for l, o in owners.items()}
+        return owners, k_dim, v_dim
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()  # ty: ignore[unresolved-attribute]
+        owners, k_dim, v_dim = self._tk_layout()
+        n = self.hparams["num_hidden_layers"]
+        arch = self.gguf_writer.arch
+        I32, U32, ARR = gguf.GGUFValueType.INT32, gguf.GGUFValueType.UINT32, gguf.GGUFValueType.ARRAY
+        self.gguf_writer.add_key_value(f"{arch}.tinykv.owners", [owners.get(i, -1) for i in range(n)], ARR, sub_type=I32)
+        self.gguf_writer.add_key_value(f"{arch}.tinykv.k_dims", [k_dim.get(i, 0) for i in range(n)], ARR, sub_type=U32)
+        self.gguf_writer.add_key_value(f"{arch}.tinykv.v_dims", [v_dim.get(i, 0) for i in range(n)], ARR, sub_type=U32)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if ".attn_tk_" in new_name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)  # ty: ignore[unresolved-attribute]
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        owners = self._tk_layout()[0]
+        if bid is not None and bid in owners and ".self_attn." in name:
+            leaf = name.split(".self_attn.", 1)[1]
+            if leaf in self._TK_MAPS:
+                yield f"blk.{bid}.attn_{leaf}.weight", data_torch.float()
+                return
+            if leaf.startswith("tk."):
+                leaf = leaf[3:]
+                if owners[bid] != bid and leaf in self._TK_REUSER_DROP:
+                    return                          # a reuser reads its owner's cache
+                yield from super().modify_tensors(data_torch, name.replace(".self_attn.tk.", ".self_attn."), bid)  # ty: ignore[unresolved-attribute]
+                return
+            if leaf in self._TK_STOCK:
+                return                              # replaced by the trained tk.* copy
+        yield from super().modify_tensors(data_torch, name, bid)  # ty: ignore[unresolved-attribute]
+
+
+@ModelBase.register("TinyKVQwen3_5ForConditionalGeneration")
+class TinyKVQwen3_5TextModel(_TinyKVMixin, Qwen3_5TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+
+@ModelBase.register("TinyKVQwen3_5MoeForConditionalGeneration")
+class TinyKVQwen3_5MoeTextModel(_TinyKVMixin, Qwen3_5MoeTextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35MOE
+
+
 @ModelBase.register("DFlashDraftModel", "DFlash2DraftModel")
 @ModelBase.example("z-lab/Qwen3.5-9B-DFlash")
 class DFlashModel(Qwen3Model):
