@@ -1,9 +1,9 @@
 // Per-token log-probabilities of fixed token sequences, for parity checks against a reference implementation.
 //
-//   llama-tinykv-logprobs <model.gguf> <in.txt> <out.txt> [n_gpu_layers=0] [flash_attn=1] [n_batch=2048]
+//   llama-tinykv-logprobs <model.gguf> <in.txt> <out.txt> [n_gpu_layers=0] [flash_attn=1] [n_batch=2048] [argmax.txt]
 //
 // in.txt: one sequence per line, space-separated token ids. out.txt: one line per sequence with log p(t_i | t_<i) for
-// i = 1..n-1, space-separated (the first token has no prediction).
+// i = 1..n-1, space-separated (the first token has no prediction). argmax.txt (optional): 1 where t_i is the argmax.
 
 #include "llama.h"
 
@@ -22,6 +22,7 @@ int main(int argc, char ** argv) {
     const int n_gpu   = argc > 4 ? std::stoi(argv[4]) : 0;
     const int fa      = argc > 5 ? std::stoi(argv[5]) : 1;
     const int n_batch = argc > 6 ? std::stoi(argv[6]) : 2048;
+    const char * f_top = argc > 7 ? argv[7] : nullptr;
 
     std::vector<std::vector<llama_token>> seqs;
     size_t n_max = 0;
@@ -60,10 +61,15 @@ int main(int argc, char ** argv) {
     }
 
     std::ofstream out(argv[3]);
+    std::ofstream top;
+    if (f_top) {
+        top.open(f_top);
+    }
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     for (const auto & s : seqs) {
         llama_memory_clear(llama_get_memory(ctx), true);
         std::vector<double> lp;
+        std::vector<int>    hit;
         for (size_t i0 = 0; i0 + 1 < s.size(); i0 += n_batch) {
             const size_t n = std::min((size_t) n_batch, s.size() - 1 - i0);   // predict up to the last token
             batch.n_tokens = n;
@@ -81,9 +87,14 @@ int main(int argc, char ** argv) {
             for (size_t j = 0; j < n; ++j) {
                 const float * lg = llama_get_logits_ith(ctx, j);
                 double mx = lg[0];
+                int    am = 0;
                 for (int v = 1; v < n_vocab; ++v) {
-                    mx = std::max(mx, (double) lg[v]);
+                    if (lg[v] > mx) {
+                        mx = lg[v];
+                        am = v;
+                    }
                 }
+                hit.push_back(am == s[i0 + j + 1]);
                 double z = 0.0;
                 for (int v = 0; v < n_vocab; ++v) {
                     z += std::exp(lg[v] - mx);
@@ -95,6 +106,12 @@ int main(int argc, char ** argv) {
             out << (i ? " " : "") << lp[i];
         }
         out << "\n";
+        if (f_top) {
+            for (size_t i = 0; i < hit.size(); ++i) {
+                top << (i ? " " : "") << hit[i];
+            }
+            top << "\n";
+        }
         fprintf(stderr, "sequence of %zu tokens: mean logp %.4f\n", s.size(), [&] { double a = 0; for (double x : lp) a += x; return a / lp.size(); }());
     }
     llama_batch_free(batch);
