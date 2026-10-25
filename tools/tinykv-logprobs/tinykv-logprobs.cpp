@@ -3,7 +3,9 @@
 //   llama-tinykv-logprobs <model.gguf> <in.txt> <out.txt> [n_gpu_layers=0] [flash_attn=1] [n_batch=2048] [argmax.txt]
 //
 // in.txt: one sequence per line, space-separated token ids. out.txt: one line per sequence with log p(t_i | t_<i) for
-// i = 1..n-1, space-separated (the first token has no prediction). argmax.txt (optional): 1 where t_i is the argmax.
+// i = 1..n-1, space-separated (the first token has no prediction). argmax.txt (optional, needle mode): 1 where t_i is
+// the argmax; in needle mode only the last 64 positions are scored (answers sit at the end; full-vocab softmax per
+// position on the CPU is otherwise the bottleneck at 100k+ tokens).
 
 #include "llama.h"
 
@@ -23,6 +25,7 @@ int main(int argc, char ** argv) {
     const int fa      = argc > 5 ? std::stoi(argv[5]) : 1;
     const int n_batch = argc > 6 ? std::stoi(argv[6]) : 2048;
     const char * f_top = argc > 7 ? argv[7] : nullptr;
+    const size_t n_tail = f_top ? 64 : 0;
 
     std::vector<std::vector<llama_token>> seqs;
     size_t n_max = 0;
@@ -73,18 +76,22 @@ int main(int argc, char ** argv) {
         for (size_t i0 = 0; i0 + 1 < s.size(); i0 += n_batch) {
             const size_t n = std::min((size_t) n_batch, s.size() - 1 - i0);   // predict up to the last token
             batch.n_tokens = n;
+            const size_t first = n_tail && s.size() - 1 > n_tail ? s.size() - 1 - n_tail : 0;   // first scored position
             for (size_t j = 0; j < n; ++j) {
                 batch.token[j]     = s[i0 + j];
                 batch.pos[j]       = i0 + j;
                 batch.n_seq_id[j]  = 1;
                 batch.seq_id[j][0] = 0;
-                batch.logits[j]    = 1;
+                batch.logits[j]    = i0 + j >= first;
             }
             if (llama_decode(ctx, batch) != 0) {
                 fprintf(stderr, "decode failed\n");
                 return 1;
             }
             for (size_t j = 0; j < n; ++j) {
+                if (!batch.logits[j]) {
+                    continue;
+                }
                 const float * lg = llama_get_logits_ith(ctx, j);
                 double mx = lg[0];
                 int    am = 0;
